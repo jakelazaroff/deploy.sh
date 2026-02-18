@@ -58,11 +58,45 @@ check_domain_collision() {
 
 get_app_port() {
 	local app_name=$1
-	local service_conf="$DEPLOY_ROOT/apps/$app_name/service.conf"
+	local port_file="$DEPLOY_ROOT/apps/$app_name/port"
 
-	if [ -f "$service_conf" ]; then
-		grep -oP -- '--port=\K\d+' "$service_conf" | head -1
+	if [ -f "$port_file" ]; then
+		cat "$port_file"
 	fi
+}
+
+read_deployfile() {
+	local deployfile=$1
+
+	if [ ! -f "$deployfile" ]; then
+		echo "❌ No deployfile found"
+		exit 1
+	fi
+
+	DEPLOY_START=""
+	DEPLOY_BUILD=""
+	DEPLOY_PORT="7890"
+
+	while IFS='=' read -r key value; do
+		# skip blank lines and comments
+		[[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+		# trim whitespace
+		key=$(echo "$key" | xargs)
+		value=$(echo "$value" | sed 's/^[[:space:]]*//')
+
+		case "$key" in
+			start) DEPLOY_START="$value" ;;
+			build) DEPLOY_BUILD="$value" ;;
+			port)  DEPLOY_PORT="$value" ;;
+		esac
+	done < "$deployfile"
+
+	if [ -z "$DEPLOY_START" ]; then
+		echo "❌ deployfile missing required 'start' command"
+		exit 1
+	fi
+
+	export DEPLOY_START DEPLOY_BUILD DEPLOY_PORT
 }
 
 # ============================================================================
@@ -227,53 +261,21 @@ cmd_create() {
 		# setup machine ID
 		systemd-machine-id-setup --root=$container_root
 
-		# install node.js in container
-		echo "📦 Installing Node.js in container..."
-		systemd-nspawn --directory=$container_root bash -c '
-			apt-get update
-			apt-get install -y curl ca-certificates gnupg
-			mkdir -p /etc/apt/keyrings
-			curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-			echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
-			apt-get update
-			apt-get install -y nodejs
-		'
-
-		# create systemd service
-		cat > $app_dir/service.conf <<-SERVICE
-			[Unit]
-			Description=$app_name container
-			After=network.target
-
-			[Service]
-			Type=notify
-			ExecStart=/usr/bin/systemd-nspawn \\
-			    --directory=$container_root \\
-			    --bind=$app_dir/current:/app \\
-			    --bind-ro=/etc/resolv.conf \\
-			    --network-veth \\
-			    --port=$port:3000 \\
-			    --chdir=/app \\
-			    bash -c "PORT=3000 npm start"
-
-			Restart=always
-			KillMode=mixed
-
-			[Install]
-			WantedBy=multi-user.target
-			SERVICE
-
-		# symlink service file
-		ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
-		systemctl daemon-reload
+		# store host port for later use
+		echo "$port" > "$app_dir/port"
 
 		echo "✅ Created app: $app_name"
 		echo "   Container: $container_root"
+		echo "   Host port: $port"
+		echo ""
+		echo "Add a deployfile to your repo root:"
+		echo "  start=npm start"
+		echo "  build=npm ci && npm run build"
+		echo "  port=3000"
 		echo ""
 		echo "Next steps:"
 		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
 		echo "  git push production main"
-		echo "  systemctl start deploy-$app_name"
 		echo "  deploy route $app_name yourdomain.com"
 	fi
 }
@@ -518,40 +520,67 @@ cmd__deploy-app() {
 
 	cd $release_dir
 
-	# run deploy script or default build
-	if [ -f "deploy.sh" ]; then
-		echo "🔧 Running custom deploy.sh..."
+	# read deployfile
+	read_deployfile "$release_dir/deployfile"
 
-		if [ -d "$container_root" ]; then
-			# run deploy.sh inside container
-			systemd-nspawn --directory=$container_root \
-				--bind=$release_dir:/build \
-				--chdir=/build \
-				bash deploy.sh
-		else
-			# static site; run on host
-			bash deploy.sh
-		fi
+	# read host port
+	local host_port=$(cat "$app_dir/port")
+	local container_port="$DEPLOY_PORT"
 
-	elif [ -f "package.json" ]; then
-		echo "📥 Installing dependencies..."
+	# run build command if present
+	if [ -n "$DEPLOY_BUILD" ]; then
+		echo "🔧 Running build..."
 
 		if [ -d "$container_root" ]; then
 			systemd-nspawn --directory=$container_root \
 				--bind=$release_dir:/build \
 				--chdir=/build \
-				bash -c 'npm ci --production && (grep -q "\"build\"" package.json && npm run build || true)'
+				bash -c "$DEPLOY_BUILD"
 		else
-			npm ci --production
-			if grep -q '"build"' package.json; then
-				npm run build
-			fi
+			bash -c "$DEPLOY_BUILD"
 		fi
 	fi
 
 	# atomic swap
 	ln -sfn $release_dir $current_link
 	echo "✅ Deployed to $current_link"
+
+	# generate start.sh wrapper
+	cat > $app_dir/start.sh <<-STARTSH
+	#!/bin/bash
+	export PORT=$container_port
+	exec $DEPLOY_START
+	STARTSH
+	chmod +x $app_dir/start.sh
+
+	# generate/update systemd service
+	cat > $app_dir/service.conf <<-SERVICE
+	[Unit]
+	Description=$app_name container
+	After=network.target
+
+	[Service]
+	Type=notify
+	ExecStart=/usr/bin/systemd-nspawn \\
+	    --directory=$container_root \\
+	    --bind=$app_dir/current:/app \\
+	    --bind-ro=$app_dir/start.sh:/app/start.sh \\
+	    --bind-ro=/etc/resolv.conf \\
+	    --network-veth \\
+	    --port=$host_port:$container_port \\
+	    --chdir=/app \\
+	    bash /app/start.sh
+
+	Restart=always
+	KillMode=mixed
+
+	[Install]
+	WantedBy=multi-user.target
+	SERVICE
+
+	# symlink service file + reload
+	ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
+	systemctl daemon-reload
 
 	# start/restart service
 	echo "🔄 Restarting $app_name..."
@@ -582,6 +611,15 @@ cmd_help() {
 		  deploy shell <name>                     Get shell inside container
 		  deploy exec <name> <command...>         Execute command in container
 		  deploy help                             Show this help
+
+		Deployfile:
+		  Add a 'deployfile' to your repo root to configure builds and runtime.
+
+		  start=npm start          # required: the long-running process command
+		  build=npm ci && npm run build  # optional: runs before each deploy
+		  port=3000                # optional: container port (default: 7890)
+
+		  The 'start' command receives PORT as an environment variable.
 		HELP
 }
 
@@ -604,3 +642,50 @@ case "${1:-help}" in
 		exit 1
 		;;
 esac
+
+#	  # Initialize system
+#	  deploy init
+#
+#	  # Create and deploy an app
+#	  deploy create myapi
+#	  git remote add production deploy@server:/srv/deploy/apps/myapi/repo.git
+#	  # Add a deployfile to your repo:
+#	  #   start=python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+#	  #   build=pip install -r requirements.txt
+#	  #   port=8000
+#	  git push production main
+#	  deploy route myapi api.example.com
+#
+#	  # Create and deploy a static site
+#	  deploy create myblog --static
+#	  git push production main
+#	  deploy route myblog blog.example.com --static
+#
+#	  # View logs
+#	  deploy logs myapi -f
+#	  deploy logs myapi --since "1 hour ago"
+#
+#	  # Get shell in container
+#	  deploy shell myapi
+#
+#	  # Install something in container
+#	  deploy exec myapi apt-get install -y ffmpeg
+#
+#	Environment:
+#	  DEPLOY_ROOT    Base directory (default: /srv/deploy)
+#	  DEPLOY_USER    System user (default: deploy)
+#
+#	Directory structure:
+#	  /srv/deploy/
+#	  ├── caddy/
+#	  │   └── Caddyfile          # Port counter + import statement
+#	  └── apps/
+#	      └── myapi/
+#	          ├── repo.git/      # Bare git repo
+#	          ├── container/     # nspawn container
+#	          ├── releases/      # Timestamped releases
+#	          ├── current        # Symlink to latest
+#	          ├── port           # Host port allocation
+#	          ├── start.sh       # Generated start wrapper
+#	          ├── service.conf   # systemd service (generated on deploy)
+#	          └── caddy.conf     # Caddy routing
