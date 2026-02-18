@@ -1,0 +1,651 @@
+#!/bin/bash
+#
+# deploy.sh - Minimal VPS deployment system
+# Install: curl -fsSL https://raw.githubusercontent.com/you/deploy/main/deploy -o /usr/local/bin/deploy && chmod +x /usr/local/bin/deploy
+
+set -e
+
+DEPLOY_ROOT=${DEPLOY_ROOT:-/srv/deploy}
+DEPLOY_USER=${DEPLOY_USER:-deploy}
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+find_next_port() {
+	local caddyfile="$DEPLOY_ROOT/caddy/Caddyfile"
+
+	if [ -f "$caddyfile" ]; then
+		local current=$(grep -oP '^# next_port=\K\d+' "$caddyfile" || echo "3000")
+		echo "$current"
+	else
+		echo "3000"
+	fi
+}
+
+increment_port() {
+	local caddyfile="$DEPLOY_ROOT/caddy/Caddyfile"
+	local current=$(find_next_port)
+	local next=$((current + 1))
+
+	if [ -f "$caddyfile" ]; then
+		sed -i "s/^# next_port=.*/# next_port=$next/" "$caddyfile"
+	fi
+
+	echo "$current"
+}
+
+check_domain_collision() {
+	local domain=$1
+	local exclude_app=${2:-}
+
+	for caddy_conf in $DEPLOY_ROOT/apps/*/caddy.conf; do
+		if [ -f "$caddy_conf" ]; then
+			local app_name=$(basename $(dirname "$caddy_conf"))
+
+			# Skip the app we're configuring
+			if [ "$app_name" = "$exclude_app" ]; then
+				continue
+			fi
+
+			if grep -q "^$domain " "$caddy_conf"; then
+				echo "❌ Domain $domain already used by $app_name"
+				exit 1
+			fi
+		fi
+	done
+}
+
+get_app_port() {
+	local app_name=$1
+	local service_conf="$DEPLOY_ROOT/apps/$app_name/service.conf"
+
+	if [ -f "$service_conf" ]; then
+		grep -oP -- '--port=\K\d+' "$service_conf" | head -1
+	fi
+}
+
+# ============================================================================
+# SUBCOMMANDS
+# ============================================================================
+
+cmd_init() {
+	echo "🚀 Setting up deployment system at $DEPLOY_ROOT..."
+
+	# Create deploy user
+	if ! id "$DEPLOY_USER" &>/dev/null; then
+		useradd -m -s /bin/bash $DEPLOY_USER
+		echo "✅ Created user: $DEPLOY_USER"
+	fi
+
+	# Create directory structure
+	mkdir -p $DEPLOY_ROOT/{apps,caddy}
+	chown -R $DEPLOY_USER:$DEPLOY_USER $DEPLOY_ROOT
+
+	# Enable systemd-machined
+	systemctl enable --now systemd-machined
+
+	# Install Caddy if needed
+	if ! command -v caddy &> /dev/null; then
+		echo "📦 Installing Caddy..."
+		curl -o /tmp/caddy.tar.gz -L "https://caddyserver.com/api/download?os=linux&arch=amd64"
+		tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
+		chmod +x /usr/local/bin/caddy
+		rm /tmp/caddy.tar.gz
+	fi
+
+	# Create main Caddyfile
+	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
+		cat > $DEPLOY_ROOT/caddy/Caddyfile <<-'CADDY'
+		# next_port=3000
+
+		{
+		    email admin@example.com
+		}
+
+		import /srv/deploy/apps/*/caddy.conf
+		CADDY
+
+		echo "📝 Created Caddyfile (update email in $DEPLOY_ROOT/caddy/Caddyfile)"
+	fi
+
+	# Create Caddy systemd service
+	cat > /etc/systemd/system/caddy.service <<-SERVICE
+	[Unit]
+	Description=Caddy
+	After=network.target
+
+	[Service]
+	Type=notify
+	User=root
+	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/caddy/Caddyfile
+	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
+	Restart=on-failure
+
+	[Install]
+	WantedBy=multi-user.target
+	SERVICE
+
+	systemctl daemon-reload
+	systemctl enable caddy
+	systemctl start caddy
+
+	echo ""
+	echo "✅ System initialized!"
+	echo "   Location: $DEPLOY_ROOT"
+	echo ""
+	echo "Next: deploy create <app-name>"
+}
+
+cmd_create() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy create <app-name> [--static]"
+		exit 1
+	fi
+
+	local app_name=$1
+	local static_mode=false
+
+	# Check for --static flag
+	for arg in "$@"; do
+		if [ "$arg" = "--static" ]; then
+			static_mode=true
+		fi
+	done
+
+	local app_dir="$DEPLOY_ROOT/apps/$app_name"
+
+	if [ -d "$app_dir" ]; then
+		echo "❌ App $app_name already exists"
+		exit 1
+	fi
+
+	# Allocate port
+	local port=$(increment_port)
+
+	echo "📦 Creating app: $app_name"
+	echo "   Port: $port"
+
+	# Create app structure
+	mkdir -p $app_dir/{releases,repo.git}
+
+	# Initialize git repo
+	cd $app_dir/repo.git
+	git init --bare
+
+	# Create post-receive hook
+	cat > hooks/post-receive <<-HOOK
+	#!/bin/bash
+	/usr/local/bin/deploy _deploy-app $app_name
+	HOOK
+
+	chmod +x hooks/post-receive
+
+	if [ "$static_mode" = true ]; then
+		# Static site - no container needed
+
+		# Create dummy service that does nothing (for consistency)
+		cat > $app_dir/service.conf <<-SERVICE
+			[Unit]
+			Description=$app_name (static site)
+			After=network.target
+
+			[Service]
+			Type=oneshot
+			ExecStart=/bin/true
+			RemainAfterExit=yes
+
+			[Install]
+			WantedBy=multi-user.target
+			SERVICE
+
+		ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
+		systemctl daemon-reload
+
+		echo "✅ Created static site: $app_name"
+		echo ""
+		echo "Next steps:"
+		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
+		echo "  git push production main"
+		echo "  deploy route $app_name yourdomain.com --static"
+
+	else
+		# Create container
+		echo "🏗️  Creating container..."
+
+		local container_root="$app_dir/container"
+
+		# Install debootstrap if needed
+		if ! command -v debootstrap &> /dev/null; then
+			echo "📦 Installing debootstrap..."
+			apt-get update && apt-get install -y debootstrap
+		fi
+
+		# Create minimal Debian container
+		debootstrap --variant=minbase stable $container_root http://deb.debian.org/debian
+
+		# Setup machine ID
+		systemd-machine-id-setup --root=$container_root
+
+		# Install Node.js in container
+		echo "📦 Installing Node.js in container..."
+		systemd-nspawn --directory=$container_root bash -c '
+			apt-get update
+			apt-get install -y curl ca-certificates gnupg
+			mkdir -p /etc/apt/keyrings
+			curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+			echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+			apt-get update
+			apt-get install -y nodejs
+		'
+
+		# Create systemd service
+		cat > $app_dir/service.conf <<-SERVICE
+			[Unit]
+			Description=$app_name container
+			After=network.target
+
+			[Service]
+			Type=notify
+			ExecStart=/usr/bin/systemd-nspawn \\
+			    --directory=$container_root \\
+			    --bind=$app_dir/current:/app \\
+			    --bind-ro=/etc/resolv.conf \\
+			    --network-veth \\
+			    --port=$port:3000 \\
+			    --chdir=/app \\
+			    bash -c "PORT=3000 npm start"
+
+			Restart=always
+			KillMode=mixed
+
+			[Install]
+			WantedBy=multi-user.target
+			SERVICE
+
+		# Symlink service file
+		ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
+		systemctl daemon-reload
+
+		echo "✅ Created app: $app_name"
+		echo "   Container: $container_root"
+		echo ""
+		echo "Next steps:"
+		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
+		echo "  git push production main"
+		echo "  systemctl start deploy-$app_name"
+		echo "  deploy route $app_name yourdomain.com"
+	fi
+}
+
+cmd_route() {
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo "Usage: deploy route <app-name> <domain> [--static]"
+		exit 1
+	fi
+
+	local app_name=$1
+	local domain=$2
+	local static_mode=false
+
+	for arg in "$@"; do
+		if [ "$arg" = "--static" ]; then
+			static_mode=true
+		fi
+	done
+
+	local app_dir="$DEPLOY_ROOT/apps/$app_name"
+
+	if [ ! -d "$app_dir" ]; then
+		echo "❌ App $app_name does not exist"
+		exit 1
+	fi
+
+	# Check for domain collision
+	check_domain_collision "$domain" "$app_name"
+
+	if [ "$static_mode" = true ]; then
+		local root_dir="$app_dir/current"
+
+		cat > $app_dir/caddy.conf <<-CADDY
+			$domain {
+			    root * $root_dir
+			    file_server
+			    try_files {path} /index.html
+			    encode gzip
+			}
+			CADDY
+
+		echo "✅ Caddy configured for static site"
+		echo "   $domain -> $root_dir"
+
+	else
+		# Get port from service.conf
+		local port=$(get_app_port "$app_name")
+
+		if [ -z "$port" ]; then
+			echo "❌ Could not determine port for $app_name"
+			exit 1
+		fi
+
+		cat > $app_dir/caddy.conf <<-CADDY
+			$domain {
+			    reverse_proxy localhost:$port
+			}
+			CADDY
+
+		echo "✅ Caddy configured for $app_name"
+		echo "   $domain -> localhost:$port"
+	fi
+
+	# Reload Caddy
+	caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
+
+	echo "🔒 HTTPS will be automatically provisioned!"
+}
+
+cmd_list() {
+	echo "📦 Deployed Apps:"
+	echo ""
+
+	if [ ! -d "$DEPLOY_ROOT/apps" ]; then
+		echo "  (none)"
+		return
+	fi
+
+	for app_dir in $DEPLOY_ROOT/apps/*; do
+		if [ ! -d "$app_dir" ]; then
+			continue
+		fi
+
+		local app_name=$(basename "$app_dir")
+
+		echo "  $app_name"
+		echo "    Location: $app_dir"
+
+		# Service status
+		if systemctl list-unit-files | grep -q "^deploy-$app_name.service"; then
+			local status=$(systemctl is-active deploy-$app_name 2>/dev/null || echo "inactive")
+			echo "    Status: $status"
+		fi
+
+		# Port
+		local port=$(get_app_port "$app_name")
+		if [ -n "$port" ]; then
+			echo "    Port: $port"
+		fi
+
+		# Domain
+		if [ -f "$app_dir/caddy.conf" ]; then
+			local domain=$(head -1 "$app_dir/caddy.conf" | awk '{print $1}')
+			echo "    Domain: $domain"
+		fi
+
+		echo ""
+	done
+}
+
+cmd_logs() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy logs <app-name> [journalctl-options...]"
+		echo ""
+		echo "Examples:"
+		echo "  deploy logs myapi"
+		echo "  deploy logs myapi -f"
+		echo "  deploy logs myapi --since '1 hour ago'"
+		exit 1
+	fi
+
+	local app_name=$1
+	shift
+
+	journalctl -u deploy-$app_name "$@"
+}
+
+cmd_restart() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy restart <app-name>"
+		exit 1
+	fi
+
+	local app_name=$1
+
+	echo "🔄 Restarting $app_name..."
+	systemctl restart deploy-$app_name
+	echo "✅ Restarted"
+}
+
+cmd_remove() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy remove <app-name>"
+		exit 1
+	fi
+
+	local app_name=$1
+	local app_dir="$DEPLOY_ROOT/apps/$app_name"
+
+	if [ ! -d "$app_dir" ]; then
+		echo "❌ App $app_name does not exist"
+		exit 1
+	fi
+
+	echo "🗑️  Removing app: $app_name"
+
+	# Stop service
+	if systemctl is-active --quiet deploy-$app_name 2>/dev/null; then
+		echo "  Stopping service..."
+		systemctl stop deploy-$app_name
+	fi
+
+	if systemctl is-enabled --quiet deploy-$app_name 2>/dev/null; then
+		systemctl disable deploy-$app_name
+	fi
+
+	# Remove service symlink
+	if [ -L "/etc/systemd/system/deploy-$app_name.service" ]; then
+		rm "/etc/systemd/system/deploy-$app_name.service"
+		systemctl daemon-reload
+	fi
+
+	# Remove from Caddy
+	if [ -f "$app_dir/caddy.conf" ]; then
+		echo "  Removing from Caddy..."
+		caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile 2>/dev/null || true
+	fi
+
+	# Remove app directory
+	echo "  Removing app files..."
+	rm -rf "$app_dir"
+
+	echo "✅ Removed $app_name"
+}
+
+cmd_shell() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy shell <app-name>"
+		exit 1
+	fi
+
+	local app_name=$1
+	local container_root="$DEPLOY_ROOT/apps/$app_name/container"
+
+	if [ ! -d "$container_root" ]; then
+		echo "❌ Container for $app_name does not exist"
+		exit 1
+	fi
+
+	echo "🐚 Entering container for $app_name..."
+	systemd-nspawn --directory=$container_root
+}
+
+cmd_exec() {
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo "Usage: deploy exec <app-name> <command...>"
+		exit 1
+	fi
+
+	local app_name=$1
+	shift
+	local container_root="$DEPLOY_ROOT/apps/$app_name/container"
+
+	if [ ! -d "$container_root" ]; then
+		echo "❌ Container for $app_name does not exist"
+		exit 1
+	fi
+
+	systemd-nspawn --directory=$container_root "$@"
+}
+
+# Internal command called by git hook
+cmd__deploy-app() {
+	if [ -z "$1" ]; then
+		echo "Internal error: app name required"
+		exit 1
+	fi
+
+	local app_name=$1
+	local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
+	local current_link="$app_dir/current"
+	local container_root="$app_dir/container"
+
+	echo "📦 Deploying $app_name..."
+
+	# Extract code to new release
+	mkdir -p $release_dir
+	GIT_DIR=$(pwd)
+	git --work-tree=$release_dir --git-dir=$GIT_DIR checkout -f
+
+	cd $release_dir
+
+	# Run deploy script or default build
+	if [ -f "deploy.sh" ]; then
+		echo "🔧 Running custom deploy.sh..."
+
+		if [ -d "$container_root" ]; then
+			# Run deploy.sh inside container
+			systemd-nspawn --directory=$container_root \
+				--bind=$release_dir:/build \
+				--chdir=/build \
+				bash deploy.sh
+		else
+			# Static site - run on host
+			bash deploy.sh
+		fi
+
+	elif [ -f "package.json" ]; then
+		echo "📥 Installing dependencies..."
+
+		if [ -d "$container_root" ]; then
+			systemd-nspawn --directory=$container_root \
+				--bind=$release_dir:/build \
+				--chdir=/build \
+				bash -c 'npm ci --production && (grep -q "\"build\"" package.json && npm run build || true)'
+		else
+			npm ci --production
+			if grep -q '"build"' package.json; then
+				npm run build
+			fi
+		fi
+	fi
+
+	# Atomic swap
+	ln -sfn $release_dir $current_link
+	echo "✅ Deployed to $current_link"
+
+	# Restart service if it's running
+	if systemctl is-active --quiet deploy-$app_name 2>/dev/null; then
+		echo "🔄 Restarting $app_name..."
+		systemctl restart deploy-$app_name
+	fi
+
+	# Cleanup old releases (keep last 5)
+	cd $app_dir/releases
+	ls -t | tail -n +6 | xargs -r rm -rf
+	echo "🧹 Cleaned up old releases"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+cmd_help() {
+	cat <<-HELP
+		deploy - Minimal VPS deployment system
+
+		Usage:
+		  deploy init                           Initialize the deployment system
+		  deploy create <name> [--static]       Create a new app
+		  deploy route <name> <domain> [--static] Route domain to app
+		  deploy list                           List all apps
+		  deploy logs <name> [options...]       Show app logs (journalctl wrapper)
+		  deploy restart <name>                 Restart an app
+		  deploy remove <name>                  Remove an app
+		  deploy shell <name>                   Get shell inside container
+		  deploy exec <name> <command...>       Execute command in container
+		  deploy help                           Show this help
+
+		Examples:
+		  # Initialize system
+		  deploy init
+
+		  # Create and deploy a Node.js app
+		  deploy create myapi
+		  git remote add production deploy@server:/srv/deploy/apps/myapi/repo.git
+		  git push production main
+		  systemctl start deploy-myapi
+		  deploy route myapi api.example.com
+
+		  # Create and deploy a static site
+		  deploy create myblog --static
+		  git push production main
+		  deploy route myblog blog.example.com --static
+
+		  # View logs
+		  deploy logs myapi -f
+		  deploy logs myapi --since "1 hour ago"
+
+		  # Get shell in container
+		  deploy shell myapi
+
+		  # Install something in container
+		  deploy exec myapi apt-get install -y ffmpeg
+
+		Environment:
+		  DEPLOY_ROOT    Base directory (default: /srv/deploy)
+		  DEPLOY_USER    System user (default: deploy)
+
+		Directory structure:
+		  /srv/deploy/
+		  ├── caddy/
+		  │   └── Caddyfile          # Port counter + import statement
+		  └── apps/
+		      └── myapi/
+		          ├── repo.git/      # Bare git repo
+		          ├── container/     # nspawn container
+		          ├── releases/      # Timestamped releases
+		          ├── current        # Symlink to latest
+		          ├── service.conf   # systemd service
+		          └── caddy.conf     # Caddy routing
+		HELP
+}
+
+# Route to subcommands
+case "${1:-help}" in
+	init)       cmd_init ;;
+	create)     shift; cmd_create "$@" ;;
+	route)      shift; cmd_route "$@" ;;
+	list)       cmd_list ;;
+	logs)       shift; cmd_logs "$@" ;;
+	restart)    shift; cmd_restart "$@" ;;
+	remove)     shift; cmd_remove "$@" ;;
+	shell)      shift; cmd_shell "$@" ;;
+	exec)       shift; cmd_exec "$@" ;;
+	_deploy-app) shift; cmd__deploy-app "$@" ;;  # Internal
+	help|--help|-h) cmd_help ;;
+	*)
+		echo "Unknown command: $1"
+		echo "Run 'deploy help' for usage"
+		exit 1
+		;;
+esac
