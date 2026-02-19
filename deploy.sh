@@ -476,6 +476,55 @@ cmd_remove() {
 	echo "✅ Removed $app_name"
 }
 
+cmd_export() {
+	local output="${1:-deploy-backup-$(date +%Y%m%d-%H%M%S).tar.gz}"
+
+	echo "📤 Exporting to $output..."
+
+	tar --exclude="apps/*/container" \
+		--exclude="apps/*/releases" \
+		-czf "$output" \
+		-C "$DEPLOY_ROOT" \
+		--dereference \
+		.
+
+	echo "✅ Exported to $output"
+	echo "   Note: containers excluded — recreated automatically on next deploy"
+}
+
+cmd_import() {
+	if [ -z "$1" ]; then
+		echo "Usage: deploy import <archive>"
+		exit 1
+	fi
+
+	local archive=$1
+
+	if [ ! -f "$archive" ]; then
+		echo "❌ Archive not found: $archive"
+		exit 1
+	fi
+
+	echo "📥 Importing from $archive..."
+
+	mkdir -p "$DEPLOY_ROOT"
+	tar -xzf "$archive" -C "$DEPLOY_ROOT"
+
+	# re-link systemd service files
+	for service_conf in "$DEPLOY_ROOT"/apps/*/service.conf; do
+		[ -f "$service_conf" ] || continue
+		local app_name
+		app_name=$(basename "$(dirname "$service_conf")")
+		ln -sf "$service_conf" "/etc/systemd/system/deploy-$app_name.service"
+	done
+
+	systemctl daemon-reload
+	caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
+
+	echo "✅ Imported successfully"
+	echo "   Note: redeploy apps to recreate containers"
+}
+
 cmd_shell() {
 	if [ -z "$1" ]; then
 		echo "Usage: deploy shell <app-name>"
@@ -602,9 +651,11 @@ cmd_help() {
 		  deploy route <name> <domain>       Route domain to app
 		  deploy list                        List all apps
 		  deploy logs <name> [options...]    Show app logs (journalctl wrapper)
+		  deploy shell <name>                Shell into container
 		  deploy restart <name>              Restart an app
 		  deploy remove <name>               Remove an app
-		  deploy shell <name>                Shell into container
+			deploy export [file]               Export backup archive
+			deploy import <file>               Restore from backup archive
 		  deploy help                        Show this help
 
 		deployfile:
@@ -625,9 +676,11 @@ case "${1:-help}" in
 	route)      shift; cmd_route "$@" ;;
 	list)       cmd_list ;;
 	logs)       shift; cmd_logs "$@" ;;
+	shell)      shift; cmd_shell "$@" ;;
 	restart)    shift; cmd_restart "$@" ;;
 	remove)     shift; cmd_remove "$@" ;;
-	shell)      shift; cmd_shell "$@" ;;
+	export)     shift; cmd_export "$@" ;;
+  import)     shift; cmd_import "$@" ;;
 	_deploy-app) shift; cmd__deploy-app "$@" ;;  # internal
 	help|--help|-h) cmd_help ;;
 	*)
