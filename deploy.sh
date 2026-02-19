@@ -91,7 +91,7 @@ read_deployfile() {
 	done < "$deployfile"
 
 	if [ -z "$DEPLOY_START" ]; then
-		echo "❌ deployfile missing required 'start' command"
+		echo "❌ deployfile missing required \"start\" command"
 		exit 1
 	fi
 
@@ -481,24 +481,6 @@ cmd_shell() {
 	systemd-nspawn --directory="$container_root"
 }
 
-cmd_exec() {
-	if [ -z "$1" ] || [ -z "$2" ]; then
-		echo "Usage: deploy exec <app-name> <command...>"
-		exit 1
-	fi
-
-	local app_name=$1
-	shift
-	local container_root="$DEPLOY_ROOT/apps/$app_name/container"
-
-	if [ ! -d "$container_root" ]; then
-		echo "❌ Container for $app_name does not exist"
-		exit 1
-	fi
-
-	systemd-nspawn --directory="$container_root" "$@"
-}
-
 # internal command called by git hook
 cmd__deploy-app() {
 	if [ -z "$1" ]; then
@@ -609,18 +591,17 @@ cmd_help() {
 		  deploy logs <name> [options...]    Show app logs (journalctl wrapper)
 		  deploy restart <name>              Restart an app
 		  deploy remove <name>               Remove an app
-		  deploy shell <name>                Get shell inside container
-		  deploy exec <name> <command...>    Execute command in container
+		  deploy shell <name>                Shell into container
 		  deploy help                        Show this help
 
 		deployfile:
-		  Add a 'deployfile' to your repo root to configure builds and runtime.
+		  Add a "deployfile" to your repo root to configure builds and runtime.
 
-		  start=npm start          # required: the long-running process command
+		  start=npm start                # required: the long-running process command
 		  build=npm ci && npm run build  # optional: runs before each deploy
-		  port=3000                # optional: container port (default: 7890)
+		  port=7890                      # optional: container port
 
-		  The 'start' command receives PORT as an environment variable.
+		  The "start" command receives PORT as an environment variable.
 		HELP
 }
 
@@ -634,12 +615,11 @@ case "${1:-help}" in
 	restart)    shift; cmd_restart "$@" ;;
 	remove)     shift; cmd_remove "$@" ;;
 	shell)      shift; cmd_shell "$@" ;;
-	exec)       shift; cmd_exec "$@" ;;
-	_deploy-app) shift; cmd__deploy-app "$@" ;;  # Internal
+	_deploy-app) shift; cmd__deploy-app "$@" ;;  # internal
 	help|--help|-h) cmd_help ;;
 	*)
 		echo "Unknown command: $1"
-		echo "Run 'deploy help' for usage"
+		echo "Run \"deploy help\" for usage"
 		exit 1
 		;;
 esac
