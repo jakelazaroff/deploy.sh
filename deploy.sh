@@ -103,7 +103,7 @@ read_deployfile() {
 # ============================================================================
 
 cmd_init() {
-	echo "🚀 Setting up deployment system at $DEPLOY_ROOT..."
+	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	# create deploy user
 	if ! id "$DEPLOY_USER" &>/dev/null; then
@@ -129,35 +129,42 @@ cmd_init() {
 
 	# create main caddyfile
 	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
-		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-'CADDY'
+		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
+
+		if [ -z "$acme_email" ]; then
+			echo "❌ Email is required for HTTPS certificate provisioning"
+			exit 1
+		fi
+
+		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-CADDY
 		# next_port=3000
 
 		{
-		    email admin@example.com
+		    email $acme_email
 		}
 
 		import /srv/deploy/apps/*/caddy.conf
 		CADDY
 
-		echo "📝 Created Caddyfile (update email in $DEPLOY_ROOT/caddy/Caddyfile)"
+		echo "📝 Created Caddyfile"
 	fi
 
 	# create caddy systemd service
 	cat > /etc/systemd/system/caddy.service <<-SERVICE
-	[Unit]
-	Description=Caddy
-	After=network.target
+		[Unit]
+		Description=Caddy
+		After=network.target
 
-	[Service]
-	Type=notify
-	User=root
-	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/caddy/Caddyfile
-	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
-	Restart=on-failure
+		[Service]
+		Type=notify
+		User=root
+		ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/caddy/Caddyfile
+		ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
+		Restart=on-failure
 
-	[Install]
-	WantedBy=multi-user.target
-	SERVICE
+		[Install]
+		WantedBy=multi-user.target
+		SERVICE
 
 	systemctl daemon-reload
 	systemctl enable caddy
@@ -188,6 +195,7 @@ cmd_create() {
 
 	local app_dir="$DEPLOY_ROOT/apps/$app_name"
 
+	# check for existing app with name
 	if [ -d "$app_dir" ]; then
 		echo "❌ App $app_name already exists"
 		exit 1
@@ -208,9 +216,9 @@ cmd_create() {
 
 	# create post-receive hook
 	cat > hooks/post-receive <<-HOOK
-	#!/bin/bash
-	/usr/local/bin/deploy _deploy-app $app_name
-	HOOK
+		#!/bin/bash
+		/usr/local/bin/deploy _deploy-app $app_name
+		HOOK
 
 	chmod +x hooks/post-receive
 
@@ -238,9 +246,9 @@ cmd_create() {
 		echo "✅ Created static site: $app_name"
 		echo
 		echo "Next steps:"
-		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
-		echo "  git push production main"
-		echo "  deploy route $app_name yourdomain.com --static"
+		echo "  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
+		echo "  git push deploy main"
+		echo "  deploy route $app_name yourdomain.com"
 
 	else
 		# create container
@@ -281,20 +289,12 @@ cmd_create() {
 
 cmd_route() {
 	if [ -z "$1" ] || [ -z "$2" ]; then
-		echo "Usage: deploy route <app-name> <domain> [--static]"
+		echo "Usage: deploy route <app-name> <domain>"
 		exit 1
 	fi
 
 	local app_name=$1
 	local domain=$2
-	local static_mode=false
-
-	for arg in "$@"; do
-		if [ "$arg" = "--static" ]; then
-			static_mode=true
-		fi
-	done
-
 	local app_dir="$DEPLOY_ROOT/apps/$app_name"
 
 	if [ ! -d "$app_dir" ]; then
@@ -302,13 +302,14 @@ cmd_route() {
 		exit 1
 	fi
 
-	# check for domain collision
-	check_domain_collision "$domain" "$app_name"
+	# check for domain collision (including within this app)
+	check_domain_collision "$domain"
 
-	if [ "$static_mode" = true ]; then
+	# detect static vs container based on whether a container was created
+	if [ ! -d "$app_dir/container" ]; then
 		local root_dir="$app_dir/current"
 
-		cat > "$app_dir/caddy.conf" <<-CADDY
+		cat >> "$app_dir/caddy.conf" <<-CADDY
 			$domain {
 			    root * $root_dir
 			    file_server
@@ -329,7 +330,7 @@ cmd_route() {
 			exit 1
 		fi
 
-		cat > "$app_dir/caddy.conf" <<-CADDY
+		cat >> "$app_dir/caddy.conf" <<-CADDY
 			$domain {
 			    reverse_proxy localhost:$port
 			}
@@ -601,16 +602,16 @@ cmd_help() {
 		🚀 deploy.sh
 
 		Usage:
-		  deploy init                             Initialize the deployment system
-		  deploy create <name> [--static]         Create a new app
-		  deploy route <name> <domain> [--static] Route domain to app
-		  deploy list                             List all apps
-		  deploy logs <name> [options...]         Show app logs (journalctl wrapper)
-		  deploy restart <name>                   Restart an app
-		  deploy remove <name>                    Remove an app
-		  deploy shell <name>                     Get shell inside container
-		  deploy exec <name> <command...>         Execute command in container
-		  deploy help                             Show this help
+		  deploy init                        Initialize the deployment system
+		  deploy create <name> [--static]    Create a new app
+		  deploy route <name> <domain>       Route domain to app
+		  deploy list                        List all apps
+		  deploy logs <name> [options...]    Show app logs (journalctl wrapper)
+		  deploy restart <name>              Restart an app
+		  deploy remove <name>               Remove an app
+		  deploy shell <name>                Get shell inside container
+		  deploy exec <name> <command...>    Execute command in container
+		  deploy help                        Show this help
 
 		deployfile:
 		  Add a 'deployfile' to your repo root to configure builds and runtime.
