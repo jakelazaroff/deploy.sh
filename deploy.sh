@@ -12,42 +12,50 @@ DEPLOY_USER=${DEPLOY_USER:-deploy}
 # UTILITIES
 # ============================================================================
 
-find_next_port() {
-	local caddyfile="$DEPLOY_ROOT/caddy/Caddyfile"
+read_state() {
+	local key=$1
+	local default=$2
+	local statefile="$DEPLOY_ROOT/state"
 
-	if [ -f "$caddyfile" ]; then
-		grep -oP '^# next_port=\K\d+' "$caddyfile" && return
+	if [ -f "$statefile" ]; then
+		local value
+		value=$(grep "^$key=" "$statefile" | cut -d= -f2-)
+		if [ -n "$value" ]; then
+			echo "$value"
+			return
+		fi
 	fi
 
-	echo "3000"
+	echo "$default"
+}
+
+write_state() {
+	local key=$1
+	local value=$2
+	local statefile="$DEPLOY_ROOT/state"
+
+	if [ -f "$statefile" ] && grep -q "^$key=" "$statefile"; then
+		sed -i "s/^$key=.*/$key=$value/" "$statefile"
+	else
+		echo "$key=$value" >> "$statefile"
+	fi
 }
 
 increment_port() {
-	local caddyfile="$DEPLOY_ROOT/caddy/Caddyfile"
-	local current=$(find_next_port)
-	local next=$((current + 1))
-
-	if [ -f "$caddyfile" ]; then
-		sed -i "s/^# next_port=.*/# next_port=$next/" "$caddyfile"
-	fi
-
+	local current
+	current=$(read_state next_port 3000)
+	write_state next_port $((current + 1))
 	echo "$current"
 }
 
 check_domain_collision() {
 	local domain=$1
-	local exclude_app=${2:-}
 
 	for caddy_conf in "$DEPLOY_ROOT"/apps/*/caddy.conf; do
 		if [ -f "$caddy_conf" ]; then
-			local app_name
-			app_name=$(basename "$(dirname "$caddy_conf")")
-
-			if [ "$app_name" = "$exclude_app" ]; then
-				continue
-			fi
-
 			if grep -q "^$domain " "$caddy_conf"; then
+				local app_name
+				app_name=$(basename "$(dirname "$caddy_conf")")
 				echo "❌ Domain $domain already used by $app_name"
 				exit 1
 			fi
@@ -137,8 +145,6 @@ cmd_init() {
 		fi
 
 		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-CADDY
-		# next_port=3000
-
 		{
 		    email $acme_email
 		}
