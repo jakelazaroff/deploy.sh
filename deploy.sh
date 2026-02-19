@@ -1,7 +1,14 @@
 #!/bin/bash
 #
-# deploy.sh - Minimal VPS deployment system
-# Install: curl -fsSL https://raw.githubusercontent.com/you/deploy/main/deploy -o /usr/local/bin/deploy && chmod +x /usr/local/bin/deploy
+# deploy.sh v0.1.0 - minimal vps deployment system
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this#
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Jake Lazaroff https://github.com/jakelazaroff/deploy.sh
+
+# Install: curl -fsSL https://raw.githubusercontent.com/jakelazaroff/deploy.sh/refs/heads/main/deploy.sh -o /usr/local/bin/deploy && chmod +x /usr/local/bin/deploy
 
 set -e
 
