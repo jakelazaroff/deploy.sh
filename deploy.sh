@@ -16,11 +16,10 @@ find_next_port() {
 	local caddyfile="$DEPLOY_ROOT/caddy/Caddyfile"
 
 	if [ -f "$caddyfile" ]; then
-		local current=$(grep -oP '^# next_port=\K\d+' "$caddyfile" || echo "3000")
-		echo "$current"
-	else
-		echo "3000"
+		grep -oP '^# next_port=\K\d+' "$caddyfile" && return
 	fi
+
+	echo "3000"
 }
 
 increment_port() {
@@ -39,11 +38,11 @@ check_domain_collision() {
 	local domain=$1
 	local exclude_app=${2:-}
 
-	for caddy_conf in $DEPLOY_ROOT/apps/*/caddy.conf; do
+	for caddy_conf in "$DEPLOY_ROOT"/apps/*/caddy.conf; do
 		if [ -f "$caddy_conf" ]; then
-			local app_name=$(basename $(dirname "$caddy_conf"))
+			local app_name
+			app_name=$(basename "$(dirname "$caddy_conf")")
 
-			# skip the app we're configuring
 			if [ "$app_name" = "$exclude_app" ]; then
 				continue
 			fi
@@ -108,13 +107,13 @@ cmd_init() {
 
 	# create deploy user
 	if ! id "$DEPLOY_USER" &>/dev/null; then
-		useradd -m -s /bin/bash $DEPLOY_USER
+		useradd -m -s /bin/bash "$DEPLOY_USER"
 		echo "✅ Created user: $DEPLOY_USER"
 	fi
 
 	# create directory structure
-	mkdir -p $DEPLOY_ROOT/{apps,caddy}
-	chown -R $DEPLOY_USER:$DEPLOY_USER $DEPLOY_ROOT
+	mkdir -p "$DEPLOY_ROOT"/{apps,caddy}
+	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
 	# enable systemd-machined
 	systemctl enable --now systemd-machined
@@ -130,7 +129,7 @@ cmd_init() {
 
 	# create main caddyfile
 	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
-		cat > $DEPLOY_ROOT/caddy/Caddyfile <<-'CADDY'
+		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-'CADDY'
 		# next_port=3000
 
 		{
@@ -164,10 +163,10 @@ cmd_init() {
 	systemctl enable caddy
 	systemctl start caddy
 
-	echo ""
+	echo
 	echo "✅ System initialized!"
 	echo "   Location: $DEPLOY_ROOT"
-	echo ""
+	echo
 	echo "Next: deploy create <app-name>"
 }
 
@@ -201,10 +200,10 @@ cmd_create() {
 	echo "   Port: $port"
 
 	# create app structure
-	mkdir -p $app_dir/{releases,repo.git}
+	mkdir -p "$app_dir"/{releases,repo.git}
 
 	# initialize git repo
-	cd $app_dir/repo.git
+	cd "$app_dir/repo.git"
 	git init --bare
 
 	# create post-receive hook
@@ -219,7 +218,7 @@ cmd_create() {
 		# static site - no container needed
 
 		# create dummy service that does nothing (for consistency)
-		cat > $app_dir/service.conf <<-SERVICE
+		cat > "$app_dir/service.conf" <<-SERVICE
 			[Unit]
 			Description=$app_name (static site)
 			After=network.target
@@ -233,11 +232,11 @@ cmd_create() {
 			WantedBy=multi-user.target
 			SERVICE
 
-		ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
+		ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
 		systemctl daemon-reload
 
 		echo "✅ Created static site: $app_name"
-		echo ""
+		echo
 		echo "Next steps:"
 		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
 		echo "  git push production main"
@@ -256,10 +255,10 @@ cmd_create() {
 		fi
 
 		# create minimal debian container
-		debootstrap --variant=minbase stable $container_root http://deb.debian.org/debian
+		debootstrap --variant=minbase stable "$container_root" http://deb.debian.org/debian
 
 		# setup machine ID
-		systemd-machine-id-setup --root=$container_root
+		systemd-machine-id-setup --root="$container_root"
 
 		# store host port for later use
 		echo "$port" > "$app_dir/port"
@@ -267,12 +266,12 @@ cmd_create() {
 		echo "✅ Created app: $app_name"
 		echo "   Container: $container_root"
 		echo "   Host port: $port"
-		echo ""
+		echo
 		echo "Add a deployfile to your repo root:"
 		echo "  start=npm start"
 		echo "  build=npm ci && npm run build"
 		echo "  port=3000"
-		echo ""
+		echo
 		echo "Next steps:"
 		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
 		echo "  git push production main"
@@ -309,7 +308,7 @@ cmd_route() {
 	if [ "$static_mode" = true ]; then
 		local root_dir="$app_dir/current"
 
-		cat > $app_dir/caddy.conf <<-CADDY
+		cat > "$app_dir/caddy.conf" <<-CADDY
 			$domain {
 			    root * $root_dir
 			    file_server
@@ -330,7 +329,7 @@ cmd_route() {
 			exit 1
 		fi
 
-		cat > $app_dir/caddy.conf <<-CADDY
+		cat > "$app_dir/caddy.conf" <<-CADDY
 			$domain {
 			    reverse_proxy localhost:$port
 			}
@@ -341,21 +340,21 @@ cmd_route() {
 	fi
 
 	# reload caddy
-	caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
+	caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile"
 
 	echo "🔒 HTTPS will be automatically provisioned!"
 }
 
 cmd_list() {
 	echo "📦 Deployed Apps:"
-	echo ""
+	echo
 
 	if [ ! -d "$DEPLOY_ROOT/apps" ]; then
 		echo "  (none)"
 		return
 	fi
 
-	for app_dir in $DEPLOY_ROOT/apps/*; do
+	for app_dir in "$DEPLOY_ROOT"/apps/*; do
 		if [ ! -d "$app_dir" ]; then
 			continue
 		fi
@@ -367,11 +366,12 @@ cmd_list() {
 
 		# service status
 		if systemctl list-unit-files | grep -q "^deploy-$app_name.service"; then
-			local status=$(systemctl is-active deploy-$app_name 2>/dev/null || echo "inactive")
+			local status
+			status=$(systemctl is-active "deploy-$app_name" 2>/dev/null || echo "inactive")
 			echo "    Status: $status"
 		fi
 
-		# oort
+		# port
 		local port=$(get_app_port "$app_name")
 		if [ -n "$port" ]; then
 			echo "    Port: $port"
@@ -383,14 +383,14 @@ cmd_list() {
 			echo "    Domain: $domain"
 		fi
 
-		echo ""
+		echo
 	done
 }
 
 cmd_logs() {
 	if [ -z "$1" ]; then
 		echo "Usage: deploy logs <app-name> [journalctl-options...]"
-		echo ""
+		echo
 		echo "Examples:"
 		echo "  deploy logs myapi"
 		echo "  deploy logs myapi -f"
@@ -401,7 +401,7 @@ cmd_logs() {
 	local app_name=$1
 	shift
 
-	journalctl -u deploy-$app_name "$@"
+	journalctl -u "deploy-$app_name" "$@"
 }
 
 cmd_restart() {
@@ -413,7 +413,7 @@ cmd_restart() {
 	local app_name=$1
 
 	echo "🔄 Restarting $app_name..."
-	systemctl restart deploy-$app_name
+	systemctl restart "deploy-$app_name"
 	echo "✅ Restarted"
 }
 
@@ -434,13 +434,13 @@ cmd_remove() {
 	echo "🗑️  Removing app: $app_name"
 
 	# stop service
-	if systemctl is-active --quiet deploy-$app_name 2>/dev/null; then
+	if systemctl is-active --quiet "deploy-$app_name" 2>/dev/null; then
 		echo "  Stopping service..."
-		systemctl stop deploy-$app_name
+		systemctl stop "deploy-$app_name"
 	fi
 
-	if systemctl is-enabled --quiet deploy-$app_name 2>/dev/null; then
-		systemctl disable deploy-$app_name
+	if systemctl is-enabled --quiet "deploy-$app_name" 2>/dev/null; then
+		systemctl disable "deploy-$app_name"
 	fi
 
 	# remove service symlink
@@ -452,7 +452,7 @@ cmd_remove() {
 	# remove from Caddy
 	if [ -f "$app_dir/caddy.conf" ]; then
 		echo "  Removing from Caddy..."
-		caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile 2>/dev/null || true
+		caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
 	fi
 
 	# remove app directory
@@ -477,7 +477,7 @@ cmd_shell() {
 	fi
 
 	echo "🐚 Entering container for $app_name..."
-	systemd-nspawn --directory=$container_root
+	systemd-nspawn --directory="$container_root"
 }
 
 cmd_exec() {
@@ -495,7 +495,7 @@ cmd_exec() {
 		exit 1
 	fi
 
-	systemd-nspawn --directory=$container_root "$@"
+	systemd-nspawn --directory="$container_root" "$@"
 }
 
 # internal command called by git hook
@@ -514,11 +514,11 @@ cmd__deploy-app() {
 	echo "📦 Deploying $app_name..."
 
 	# extract code to new release
-	mkdir -p $release_dir
+	mkdir -p "$release_dir"
 	GIT_DIR=$(pwd)
-	git --work-tree=$release_dir --git-dir=$GIT_DIR checkout -f
+	git --work-tree="$release_dir" --git-dir="$GIT_DIR" checkout -f
 
-	cd $release_dir
+	cd "$release_dir"
 
 	# read deployfile
 	read_deployfile "$release_dir/deployfile"
@@ -532,8 +532,8 @@ cmd__deploy-app() {
 		echo "🔧 Running build..."
 
 		if [ -d "$container_root" ]; then
-			systemd-nspawn --directory=$container_root \
-				--bind=$release_dir:/build \
+			systemd-nspawn --directory="$container_root" \
+				--bind="$release_dir":/build \
 				--chdir=/build \
 				bash -c "$DEPLOY_BUILD"
 		else
@@ -542,52 +542,52 @@ cmd__deploy-app() {
 	fi
 
 	# atomic swap
-	ln -sfn $release_dir $current_link
+	ln -sfn "$release_dir" "$current_link"
 	echo "✅ Deployed to $current_link"
 
 	# generate start.sh wrapper
-	cat > $app_dir/start.sh <<-STARTSH
+	cat > "$app_dir/start.sh" <<-STARTSH
 	#!/bin/bash
 	export PORT=$container_port
 	exec $DEPLOY_START
 	STARTSH
-	chmod +x $app_dir/start.sh
+	chmod +x "$app_dir/start.sh"
 
 	# generate/update systemd service
-	cat > $app_dir/service.conf <<-SERVICE
-	[Unit]
-	Description=$app_name container
-	After=network.target
+	cat > "$app_dir/service.conf" <<-SERVICE
+		[Unit]
+		Description=$app_name container
+		After=network.target
 
-	[Service]
-	Type=notify
-	ExecStart=/usr/bin/systemd-nspawn \\
-	    --directory=$container_root \\
-	    --bind=$app_dir/current:/app \\
-	    --bind-ro=$app_dir/start.sh:/app/start.sh \\
-	    --bind-ro=/etc/resolv.conf \\
-	    --network-veth \\
-	    --port=$host_port:$container_port \\
-	    --chdir=/app \\
-	    bash /app/start.sh
+		[Service]
+		Type=notify
+		ExecStart=/usr/bin/systemd-nspawn \\
+		    --directory=$container_root \\
+		    --bind=$app_dir/current:/app \\
+		    --bind-ro=$app_dir/start.sh:/app/start.sh \\
+		    --bind-ro=/etc/resolv.conf \\
+		    --network-veth \\
+		    --port=$host_port:$container_port \\
+		    --chdir=/app \\
+		    bash /app/start.sh
 
-	Restart=always
-	KillMode=mixed
+		Restart=always
+		KillMode=mixed
 
-	[Install]
-	WantedBy=multi-user.target
-	SERVICE
+		[Install]
+		WantedBy=multi-user.target
+		SERVICE
 
 	# symlink service file + reload
-	ln -sf $app_dir/service.conf /etc/systemd/system/deploy-$app_name.service
+	ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
 	systemctl daemon-reload
 
 	# start/restart service
 	echo "🔄 Restarting $app_name..."
-	systemctl restart deploy-$app_name
+	systemctl restart "deploy-$app_name"
 
 	# cleanup old releases (keep last 5)
-	cd $app_dir/releases
+	cd "$app_dir/releases"
 	ls -t | tail -n +6 | xargs -r rm -rf
 	echo "🧹 Cleaned up old releases"
 }
@@ -612,7 +612,7 @@ cmd_help() {
 		  deploy exec <name> <command...>         Execute command in container
 		  deploy help                             Show this help
 
-		Deployfile:
+		deployfile:
 		  Add a 'deployfile' to your repo root to configure builds and runtime.
 
 		  start=npm start          # required: the long-running process command
@@ -642,50 +642,3 @@ case "${1:-help}" in
 		exit 1
 		;;
 esac
-
-#	  # Initialize system
-#	  deploy init
-#
-#	  # Create and deploy an app
-#	  deploy create myapi
-#	  git remote add production deploy@server:/srv/deploy/apps/myapi/repo.git
-#	  # Add a deployfile to your repo:
-#	  #   start=python -m uvicorn main:app --host 0.0.0.0 --port $PORT
-#	  #   build=pip install -r requirements.txt
-#	  #   port=8000
-#	  git push production main
-#	  deploy route myapi api.example.com
-#
-#	  # Create and deploy a static site
-#	  deploy create myblog --static
-#	  git push production main
-#	  deploy route myblog blog.example.com --static
-#
-#	  # View logs
-#	  deploy logs myapi -f
-#	  deploy logs myapi --since "1 hour ago"
-#
-#	  # Get shell in container
-#	  deploy shell myapi
-#
-#	  # Install something in container
-#	  deploy exec myapi apt-get install -y ffmpeg
-#
-#	Environment:
-#	  DEPLOY_ROOT    Base directory (default: /srv/deploy)
-#	  DEPLOY_USER    System user (default: deploy)
-#
-#	Directory structure:
-#	  /srv/deploy/
-#	  ├── caddy/
-#	  │   └── Caddyfile          # Port counter + import statement
-#	  └── apps/
-#	      └── myapi/
-#	          ├── repo.git/      # Bare git repo
-#	          ├── container/     # nspawn container
-#	          ├── releases/      # Timestamped releases
-#	          ├── current        # Symlink to latest
-#	          ├── port           # Host port allocation
-#	          ├── start.sh       # Generated start wrapper
-#	          ├── service.conf   # systemd service (generated on deploy)
-#	          └── caddy.conf     # Caddy routing
