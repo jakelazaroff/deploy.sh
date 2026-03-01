@@ -126,20 +126,29 @@ cmd_init() {
 		echo "✅ Created user: $DEPLOY_USER"
 	fi
 
+	# set up SSH access for deploy user
+	read -rp "🔑 Public key for SSH access (paste your ~/.ssh/id_*.pub): " public_key
+
+	if [ -z "$public_key" ]; then
+		echo "⚠️  No public key provided — add it manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
+	else
+		mkdir -p "/home/$DEPLOY_USER/.ssh"
+		echo "$public_key" >> "/home/$DEPLOY_USER/.ssh/authorized_keys"
+		chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
+		chmod 700 "/home/$DEPLOY_USER/.ssh"
+		chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
+		echo "✅ Added public key for $DEPLOY_USER"
+	fi
+
 	# create directory structure
 	mkdir -p "$DEPLOY_ROOT"/{apps,caddy}
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
-	# enable systemd-machined
-	systemctl enable --now systemd-machined
-
 	# install caddy if needed
 	if ! command -v caddy &> /dev/null; then
 		echo "📦 Installing Caddy..."
-		curl -o /tmp/caddy.tar.gz -L "https://caddyserver.com/api/download?os=linux&arch=amd64"
-		tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
+		curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy
 		chmod +x /usr/local/bin/caddy
-		rm /tmp/caddy.tar.gz
 	fi
 
 	# create main caddyfile
@@ -225,7 +234,7 @@ cmd_create() {
 
 	# initialize git repo
 	cd "$app_dir/repo.git"
-	git init --bare
+	git init --bare --initial-branch=main
 
 	# create post-receive hook
 	cat > hooks/post-receive <<-HOOK
@@ -234,6 +243,9 @@ cmd_create() {
 		HOOK
 
 	chmod +x hooks/post-receive
+
+	# ensure deploy user owns the app directory
+	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 
 	if [ "$static_mode" = true ]; then
 		# static site - no container needed
@@ -381,7 +393,7 @@ cmd_list() {
 		# service status
 		if systemctl list-unit-files | grep -q "^deploy-$app_name.service"; then
 			local status
-			status=$(systemctl is-active "deploy-$app_name" 2>/dev/null || echo "inactive")
+			status=$(systemctl is-active "deploy-$app_name" 2>/dev/null || true)
 			echo "    Status: $status"
 		fi
 
@@ -560,76 +572,80 @@ cmd__deploy-app() {
 
 	# extract code to new release
 	mkdir -p "$release_dir"
-	GIT_DIR=$(pwd)
-	git --work-tree="$release_dir" --git-dir="$GIT_DIR" checkout -f
+	local repo_dir
+	repo_dir=$(pwd)
+	unset GIT_DIR  # git sets this in the hook environment; clear it to avoid conflicts
+	git --work-tree="$release_dir" --git-dir="$repo_dir" checkout HEAD -f
 
 	cd "$release_dir"
 
-	# read deployfile
-	read_deployfile "$release_dir/deployfile"
+	if [ ! -d "$container_root" ]; then
+		# static site — just swap and reload caddy
+		ln -sfn "$release_dir" "$current_link"
+		echo "✅ Deployed to $current_link"
+		caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
+	else
+		# read deployfile
+		read_deployfile "$release_dir/deployfile"
 
-	# read host port
-	local host_port=$(cat "$app_dir/port")
-	local container_port="$DEPLOY_PORT"
+		# read host port
+		local host_port=$(cat "$app_dir/port")
+		local container_port="$DEPLOY_PORT"
 
-	# run build command if present
-	if [ -n "$DEPLOY_BUILD" ]; then
-		echo "🔧 Running build..."
-
-		if [ -d "$container_root" ]; then
+		# run build command if present
+		if [ -n "$DEPLOY_BUILD" ]; then
+			echo "🔧 Running build..."
 			systemd-nspawn --directory="$container_root" \
 				--bind="$release_dir":/build \
 				--chdir=/build \
 				bash -c "$DEPLOY_BUILD"
-		else
-			bash -c "$DEPLOY_BUILD"
 		fi
+
+		# atomic swap
+		ln -sfn "$release_dir" "$current_link"
+		echo "✅ Deployed to $current_link"
+
+		# generate start.sh wrapper
+		cat > "$app_dir/start.sh" <<-STARTSH
+		#!/bin/bash
+		export PORT=$container_port
+		exec $DEPLOY_START
+		STARTSH
+		chmod +x "$app_dir/start.sh"
+
+		# generate/update systemd service
+		cat > "$app_dir/service.conf" <<-SERVICE
+			[Unit]
+			Description=$app_name container
+			After=network.target
+
+			[Service]
+			Type=notify
+			ExecStart=/usr/bin/systemd-nspawn \\
+			    --directory=$container_root \\
+			    --bind=$app_dir/current:/app \\
+			    --bind-ro=$app_dir/start.sh:/app/start.sh \\
+			    --bind-ro=/etc/resolv.conf \\
+			    --network-veth \\
+			    --port=$host_port:$container_port \\
+			    --chdir=/app \\
+			    bash /app/start.sh
+
+			Restart=always
+			KillMode=mixed
+
+			[Install]
+			WantedBy=multi-user.target
+			SERVICE
+
+		# symlink service file + reload
+		ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
+		systemctl daemon-reload
+
+		# start/restart service
+		echo "🔄 Restarting $app_name..."
+		systemctl restart "deploy-$app_name"
 	fi
-
-	# atomic swap
-	ln -sfn "$release_dir" "$current_link"
-	echo "✅ Deployed to $current_link"
-
-	# generate start.sh wrapper
-	cat > "$app_dir/start.sh" <<-STARTSH
-	#!/bin/bash
-	export PORT=$container_port
-	exec $DEPLOY_START
-	STARTSH
-	chmod +x "$app_dir/start.sh"
-
-	# generate/update systemd service
-	cat > "$app_dir/service.conf" <<-SERVICE
-		[Unit]
-		Description=$app_name container
-		After=network.target
-
-		[Service]
-		Type=notify
-		ExecStart=/usr/bin/systemd-nspawn \\
-		    --directory=$container_root \\
-		    --bind=$app_dir/current:/app \\
-		    --bind-ro=$app_dir/start.sh:/app/start.sh \\
-		    --bind-ro=/etc/resolv.conf \\
-		    --network-veth \\
-		    --port=$host_port:$container_port \\
-		    --chdir=/app \\
-		    bash /app/start.sh
-
-		Restart=always
-		KillMode=mixed
-
-		[Install]
-		WantedBy=multi-user.target
-		SERVICE
-
-	# symlink service file + reload
-	ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
-	systemctl daemon-reload
-
-	# start/restart service
-	echo "🔄 Restarting $app_name..."
-	systemctl restart "deploy-$app_name"
 
 	# cleanup old releases (keep last 5)
 	cd "$app_dir/releases"
