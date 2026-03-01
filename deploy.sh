@@ -192,6 +192,31 @@ cmd_init() {
 	systemctl enable caddy
 	systemctl start caddy
 
+	# create deploy template service
+	mkdir -p /etc/systemd/nspawn
+	cat > /etc/systemd/system/deploy@.service <<-SERVICE
+		[Unit]
+		Description=%i container
+		After=network.target
+
+		[Service]
+		Type=notify
+		ExecStart=/usr/bin/systemd-nspawn \\
+		    --quiet \\
+		    --keep-unit \\
+		    --settings=override \\
+		    --machine=deploy-%i \\
+		    --directory=$DEPLOY_ROOT/apps/%i/container
+
+		Restart=always
+		KillMode=mixed
+
+		[Install]
+		WantedBy=multi-user.target
+		SERVICE
+
+	echo "📝 Created deploy@.service template"
+
 	echo
 	echo "✅ System initialized!"
 	echo "   Location: $DEPLOY_ROOT"
@@ -296,6 +321,9 @@ cmd_create() {
 		# store host port for later use
 		echo "$port" > "$app_dir/port"
 
+		# NOTE: .nspawn file will be created on first deploy when we know the container port
+		# The template service is already available at /etc/systemd/system/deploy@.service
+
 		echo "✅ Created app: $app_name"
 		echo "   Container: $container_root"
 		echo "   Host port: $port"
@@ -391,9 +419,9 @@ cmd_list() {
 		echo "    Location: $app_dir"
 
 		# service status
-		if systemctl list-unit-files | grep -q "^deploy-$app_name.service"; then
+		if systemctl list-unit-files | grep -q "^deploy@.service"; then
 			local status
-			status=$(systemctl is-active "deploy-$app_name" 2>/dev/null || true)
+			status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
 			echo "    Status: $status"
 		fi
 
@@ -427,7 +455,7 @@ cmd_logs() {
 	local app_name=$1
 	shift
 
-	journalctl -u "deploy-$app_name" "$@"
+	journalctl -u "deploy@$app_name" "$@"
 }
 
 cmd_restart() {
@@ -439,7 +467,7 @@ cmd_restart() {
 	local app_name=$1
 
 	echo "🔄 Restarting $app_name..."
-	systemctl restart "deploy-$app_name"
+	systemctl restart "deploy@$app_name"
 	echo "✅ Restarted"
 }
 
@@ -460,18 +488,18 @@ cmd_remove() {
 	echo "🗑️  Removing app: $app_name"
 
 	# stop service
-	if systemctl is-active --quiet "deploy-$app_name" 2>/dev/null; then
+	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
 		echo "  Stopping service..."
-		systemctl stop "deploy-$app_name"
+		systemctl stop "deploy@$app_name"
 	fi
 
-	if systemctl is-enabled --quiet "deploy-$app_name" 2>/dev/null; then
-		systemctl disable "deploy-$app_name"
+	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then
+		systemctl disable "deploy@$app_name"
 	fi
 
-	# remove service symlink
-	if [ -L "/etc/systemd/system/deploy-$app_name.service" ]; then
-		rm "/etc/systemd/system/deploy-$app_name.service"
+	# remove .nspawn configuration file
+	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then
+		rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"
 		systemctl daemon-reload
 	fi
 
@@ -521,14 +549,6 @@ cmd_import() {
 
 	mkdir -p "$DEPLOY_ROOT"
 	tar -xzf "$archive" -C "$DEPLOY_ROOT"
-
-	# re-link systemd service files
-	for service_conf in "$DEPLOY_ROOT"/apps/*/service.conf; do
-		[ -f "$service_conf" ] || continue
-		local app_name
-		app_name=$(basename "$(dirname "$service_conf")")
-		ln -sf "$service_conf" "/etc/systemd/system/deploy-$app_name.service"
-	done
 
 	systemctl daemon-reload
 	caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
@@ -613,38 +633,32 @@ cmd__deploy-app() {
 		STARTSH
 		chmod +x "$app_dir/start.sh"
 
-		# generate/update systemd service
-		cat > "$app_dir/service.conf" <<-SERVICE
-			[Unit]
-			Description=$app_name container
-			After=network.target
+		# generate/update .nspawn configuration
+		cat > "/etc/systemd/nspawn/deploy-$app_name.nspawn" <<-NSPAWN
+			[Exec]
+			Boot=no
 
-			[Service]
-			Type=notify
-			ExecStart=/usr/bin/systemd-nspawn \\
-			    --directory=$container_root \\
-			    --bind=$app_dir/current:/app \\
-			    --bind-ro=$app_dir/start.sh:/app/start.sh \\
-			    --bind-ro=/etc/resolv.conf \\
-			    --network-veth \\
-			    --port=$host_port:$container_port \\
-			    --chdir=/app \\
-			    bash /app/start.sh
+			[Files]
+			Bind=$app_dir/current:/app
+			BindReadOnly=$app_dir/start.sh:/app/start.sh
+			BindReadOnly=/etc/resolv.conf
 
-			Restart=always
-			KillMode=mixed
+			[Network]
+			Private=yes
+			VirtualEthernet=yes
+			Port=tcp:$host_port:$container_port
+			NSPAWN
 
-			[Install]
-			WantedBy=multi-user.target
-			SERVICE
-
-		# symlink service file + reload
-		ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
 		systemctl daemon-reload
+
+		# enable service instance if not already enabled
+		if ! systemctl is-enabled "deploy@$app_name.service" &>/dev/null; then
+			systemctl enable "deploy@$app_name.service"
+		fi
 
 		# start/restart service
 		echo "🔄 Restarting $app_name..."
-		systemctl restart "deploy-$app_name"
+		systemctl restart "deploy@$app_name"
 	fi
 
 	# cleanup old releases (keep last 5)
