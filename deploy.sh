@@ -446,24 +446,22 @@ cmd_help() {
 	deploy.conf:
 	  Add a "deploy.conf" to your repo root to configure your app.
 
-	  # For containers
-	  start=npm start                # required: the long-running process command
-	  build=npm ci && npm run build  # optional: runs before each deploy
-	  port=3000                      # optional: container port (default: 7890)
-	  assets=public                  # optional: serve assets before proxying
-
 	  # For static sites
-	  build=npm ci && npm run build  # optional: runs in ephemeral container before deploy
-	  assets=dist                    # optional: assets directory (default: repo root)
-	  spa=true                       # optional: SPA mode (serve /index.html with 200 for non-files)
+	  build=npm ci && npm run build      # optional: build in ephemeral container before deploy
+	  assets=dist                        # optional: assets directory (default: repo root)
+	  spa=true                           # optional: single-page app mode (serve /index.html with 200 for non-files)
+
+	  # For containers
+	  start=npm start                    # required: the long-running process command
+	  build=npm ci && npm run build      # optional: runs before each deploy
+	  port=3000                          # optional: container port (default: 7890)
+	  assets=public                      # optional: serve assets before proxying
+	  bind=/data/uploads:/app/uploads    # read-write mount
+	  bind=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
 
 	  # For all apps (static sites and containers)
-	  domain=example.com             # optional: domain routing (multi-value)
-	  domain=www.example.com         # can specify multiple domains
-
-	  # Bind mounts (containers only, Docker-style syntax)
-	  bind=/data/uploads:/app/uploads          # read-write mount
-	  bind=/etc/secrets:/app/secrets:ro        # read-only mount (:ro)
+	  domain=example.com                 # optional: domain routing (multi-value)
+	  domain=www.example.com             # can specify multiple domains
 
 	  The "start" command receives PORT as an environment variable.
 	  Containers are accessible at: deploy-<app-name>.nspawn:<port>
