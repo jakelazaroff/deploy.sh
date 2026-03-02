@@ -183,6 +183,7 @@ cmd_create() {
 
 	  For a static site:
 	    domain=yourdomain.com
+	    build=npm ci && npm run build
 	    assets=dist
 	    spa=true
 
@@ -285,6 +286,21 @@ cmd__deploy-app() {
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running build..."
 		systemd-nspawn --directory="$container_root" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+	elif [ -z "$start_cmd" ] && [ -n "$build_cmd" ]; then
+		echo "🔧 Running static site build in ephemeral container..."
+		local build_container="$app_dir/build-container"
+
+		if [ ! -d "$build_container" ]; then
+			echo "  Creating build container..."
+			command -v debootstrap &>/dev/null || { echo "📦 Installing debootstrap..."; apt-get update && apt-get install -y debootstrap; }
+			debootstrap --variant=minbase stable "$build_container" http://deb.debian.org/debian
+		fi
+
+		systemd-nspawn --directory="$build_container" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+
+		echo "  Cleaning up build container..."
+		rm -rf "$build_container"
+		echo "✅ Build complete"
 	fi
 
 	cmd__sync "$app_name"
@@ -437,6 +453,7 @@ cmd_help() {
 	  assets=public                  # optional: serve assets before proxying
 
 	  # For static sites
+	  build=npm ci && npm run build  # optional: runs in ephemeral container before deploy
 	  assets=dist                    # optional: assets directory (default: repo root)
 	  spa=true                       # optional: SPA mode (serve /index.html with 200 for non-files)
 
