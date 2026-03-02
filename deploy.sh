@@ -184,6 +184,7 @@ cmd_create() {
 	  For a static site:
 	    domain=yourdomain.com
 	    assets=dist
+	    spa=true
 
 	Next steps:
 	  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git
@@ -305,19 +306,37 @@ cmd__sync() {
 	local domains=()
 	while IFS= read -r domain; do domains+=("$domain"); done < <(get_conf_all "$deployfile" "domain")
 	local static_dir=$(get_conf "$deployfile" "assets")
+	local spa_mode=$(get_conf "$deployfile" "spa")
 
 	for domain in "${domains[@]}"; do
 		if $is_static; then
 			local root_path="$app_dir/current"
 			[ -n "$static_dir" ] && root_path="$app_dir/current/$static_dir"
-			cat >> "$app_dir/caddy.conf" <<-CADDY
-			$domain {
-			    root * $root_path
-			    file_server
-			    try_files {path} /index.html
-			    encode gzip
-			}
-			CADDY
+
+			if [ "$spa_mode" = "true" ]; then
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    root * $root_path
+				    encode gzip
+
+				    @notFile {
+				        not file
+				        not path */
+				    }
+				    rewrite @notFile /index.html
+				    file_server
+				}
+				CADDY
+			else
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    root * $root_path
+				    file_server
+				    try_files {path} /index.html
+				    encode gzip
+				}
+				CADDY
+			fi
 		else
 			if [ -n "$static_dir" ]; then
 				cat >> "$app_dir/caddy.conf" <<-CADDY
@@ -342,6 +361,7 @@ cmd__sync() {
 	done
 	[ ${#domains[@]} -gt 0 ] && echo "    Configured ${#domains[@]} domain(s): ${domains[*]}" || echo "    No domains configured"
 	[ -n "$static_dir" ] && echo "    Assets directory: $static_dir"
+	[ "$spa_mode" = "true" ] && echo "    SPA mode: enabled"
 
 	if ! $is_static; then
 		echo "  📝 Generating .nspawn config..."
@@ -418,6 +438,7 @@ cmd_help() {
 
 	  # For static sites
 	  assets=dist                    # optional: assets directory (default: repo root)
+	  spa=true                       # optional: SPA mode (serve /index.html with 200 for non-files)
 
 	  # For all apps (static sites and containers)
 	  domain=example.com             # optional: domain routing (multi-value)
