@@ -178,10 +178,12 @@ cmd_create() {
 	    build=npm ci && npm run build
 	    port=3000
 	    domain=yourdomain.com
+	    assets=public
 	    bind=/data/uploads:/app/uploads
 
 	  For a static site:
 	    domain=yourdomain.com
+	    assets=dist
 
 	Next steps:
 	  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git
@@ -302,21 +304,44 @@ cmd__sync() {
 	> "$app_dir/caddy.conf"
 	local domains=()
 	while IFS= read -r domain; do domains+=("$domain"); done < <(get_conf_all "$deployfile" "domain")
+	local static_dir=$(get_conf "$deployfile" "assets")
+
 	for domain in "${domains[@]}"; do
 		if $is_static; then
+			local root_path="$app_dir/current"
+			[ -n "$static_dir" ] && root_path="$app_dir/current/$static_dir"
 			cat >> "$app_dir/caddy.conf" <<-CADDY
 			$domain {
-			    root * $app_dir/current
+			    root * $root_path
 			    file_server
 			    try_files {path} /index.html
 			    encode gzip
 			}
 			CADDY
 		else
-			echo "$domain { reverse_proxy http://deploy-$app_name.nspawn:$port }" >> "$app_dir/caddy.conf"
+			if [ -n "$static_dir" ]; then
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    root * $app_dir/current/$static_dir
+
+				    @static file
+				    handle @static {
+				        file_server
+				        encode gzip
+				    }
+
+				    handle {
+				        reverse_proxy http://deploy-$app_name.nspawn:$port
+				    }
+				}
+				CADDY
+			else
+				echo "$domain { reverse_proxy http://deploy-$app_name.nspawn:$port }" >> "$app_dir/caddy.conf"
+			fi
 		fi
 	done
 	[ ${#domains[@]} -gt 0 ] && echo "    Configured ${#domains[@]} domain(s): ${domains[*]}" || echo "    No domains configured"
+	[ -n "$static_dir" ] && echo "    Assets directory: $static_dir"
 
 	if ! $is_static; then
 		echo "  📝 Generating .nspawn config..."
@@ -389,6 +414,10 @@ cmd_help() {
 	  start=npm start                # required: the long-running process command
 	  build=npm ci && npm run build  # optional: runs before each deploy
 	  port=3000                      # optional: container port (default: 7890)
+	  assets=public                  # optional: serve assets before proxying
+
+	  # For static sites
+	  assets=dist                    # optional: assets directory (default: repo root)
 
 	  # For all apps (static sites and containers)
 	  domain=example.com             # optional: domain routing (multi-value)
