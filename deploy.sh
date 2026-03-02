@@ -48,13 +48,6 @@ write_state() {
 	fi
 }
 
-increment_port() {
-	local current
-	current=$(read_state next_port 3000)
-	write_state next_port $((current + 1))
-	echo "$current"
-}
-
 check_domain_collision() {
 	local domain=$1
 
@@ -68,15 +61,6 @@ check_domain_collision() {
 			fi
 		fi
 	done
-}
-
-get_app_port() {
-	local app_name=$1
-	local port_file="$DEPLOY_ROOT/apps/$app_name/port"
-
-	if [ -f "$port_file" ]; then
-		cat "$port_file"
-	fi
 }
 
 read_deployfile() {
@@ -143,6 +127,22 @@ cmd_init() {
 	# create directory structure
 	mkdir -p "$DEPLOY_ROOT"/{apps,caddy}
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
+
+	# configure nss-mymachines for container hostname resolution
+	if ! grep -q "mymachines" /etc/nsswitch.conf 2>/dev/null; then
+		echo "🔧 Configuring container hostname resolution..."
+
+		# backup original
+		cp /etc/nsswitch.conf /etc/nsswitch.conf.backup
+
+		# add mymachines to hosts line
+		sed -i 's/^hosts:.*/hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns/' /etc/nsswitch.conf
+
+		echo "✅ Configured /etc/nsswitch.conf for container resolution"
+	fi
+
+	# ensure systemd-machined is running
+	systemctl enable systemd-machined 2>/dev/null || true
 
 	# install caddy if needed
 	if ! command -v caddy &> /dev/null; then
@@ -248,11 +248,7 @@ cmd_create() {
 		exit 1
 	fi
 
-	# allocate port
-	local port=$(increment_port)
-
 	echo "📦 Creating app: $app_name"
-	echo "   Port: $port"
 
 	# create app structure
 	mkdir -p "$app_dir"/{releases,repo.git}
@@ -318,20 +314,17 @@ cmd_create() {
 		# setup machine ID
 		systemd-machine-id-setup --root="$container_root"
 
-		# store host port for later use
-		echo "$port" > "$app_dir/port"
-
 		# NOTE: .nspawn file will be created on first deploy when we know the container port
 		# The template service is already available at /etc/systemd/system/deploy@.service
 
 		echo "✅ Created app: $app_name"
 		echo "   Container: $container_root"
-		echo "   Host port: $port"
+		echo "   Machine: deploy-$app_name"
 		echo
 		echo "Add a deployfile to your repo root:"
 		echo "  start=npm start"
 		echo "  build=npm ci && npm run build"
-		echo "  port=3000"
+		echo "  port=7890"
 		echo
 		echo "Next steps:"
 		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
@@ -375,22 +368,22 @@ cmd_route() {
 		echo "   $domain -> $root_dir"
 
 	else
-		# get port from service.conf
-		local port=$(get_app_port "$app_name")
+		# get container port from deployfile or use default
+		local container_port="7890"
 
-		if [ -z "$port" ]; then
-			echo "❌ Could not determine port for $app_name"
-			exit 1
+		if [ -f "$app_dir/current/deployfile" ]; then
+			read_deployfile "$app_dir/current/deployfile"
+			container_port="$DEPLOY_PORT"
 		fi
 
 		cat >> "$app_dir/caddy.conf" <<-CADDY
 			$domain {
-			    reverse_proxy localhost:$port
+			    reverse_proxy http://deploy-$app_name.nspawn:$container_port
 			}
 			CADDY
 
 		echo "✅ Caddy configured for $app_name"
-		echo "   $domain -> localhost:$port"
+		echo "   $domain -> http://deploy-$app_name.nspawn:$container_port"
 	fi
 
 	# reload caddy
@@ -425,10 +418,9 @@ cmd_list() {
 			echo "    Status: $status"
 		fi
 
-		# port
-		local port=$(get_app_port "$app_name")
-		if [ -n "$port" ]; then
-			echo "    Port: $port"
+		# machine name
+		if [ -d "$app_dir/container" ]; then
+			echo "    Machine: deploy-$app_name.nspawn"
 		fi
 
 		# domain
@@ -608,8 +600,6 @@ cmd__deploy-app() {
 		# read deployfile
 		read_deployfile "$release_dir/deployfile"
 
-		# read host port
-		local host_port=$(cat "$app_dir/port")
 		local container_port="$DEPLOY_PORT"
 
 		# run build command if present
@@ -644,9 +634,7 @@ cmd__deploy-app() {
 			BindReadOnly=/etc/resolv.conf
 
 			[Network]
-			Private=yes
-			VirtualEthernet=yes
-			Port=tcp:$host_port:$container_port
+			Zone=deploy
 			NSPAWN
 
 		systemctl daemon-reload
@@ -693,9 +681,10 @@ cmd_help() {
 
 		  start=npm start                # required: the long-running process command
 		  build=npm ci && npm run build  # optional: runs before each deploy
-		  port=7890                      # optional: container port
+		  port=7890                      # optional: container port (default: 7890)
 
 		  The "start" command receives PORT as an environment variable.
+		  Containers are accessible at: deploy-<app-name>.nspawn:<port>
 		HELP
 }
 
