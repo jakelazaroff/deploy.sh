@@ -1,6 +1,6 @@
 # deploy.sh
 
-Turn your Linux VPS into a PaaS with a ~700 line Bash script!
+Turn your Linux VPS into a PaaS with a ~400 line Bash script!
 
 Features:
 
