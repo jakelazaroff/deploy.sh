@@ -1,7 +1,0 @@
-- create app.conf key=value config file
-- reusing a key creates a list
-- app caddyfile and nspawn configs are derived from conf
-- an (internal?) "reconcile" command (re)creates the derived files and (re)starts the services
-- command to modify config file
-- "route" just becomes a config subcommand
-- add config support for binding writable and readonly filesystem mounts

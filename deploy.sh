@@ -50,51 +50,95 @@ write_state() {
 
 check_domain_collision() {
 	local domain=$1
+	local exclude_app=${2:-}
 
-	for caddy_conf in "$DEPLOY_ROOT"/apps/*/caddy.conf; do
-		if [ -f "$caddy_conf" ]; then
-			if grep -q "^$domain " "$caddy_conf"; then
-				local app_name
-				app_name=$(basename "$(dirname "$caddy_conf")")
+	for deployfile in "$DEPLOY_ROOT"/apps/*/current/deployfile; do
+		if [ ! -f "$deployfile" ]; then
+			continue
+		fi
+
+		local app_name
+		app_name=$(basename "$(dirname "$(dirname "$deployfile")")")
+
+		# Skip the app we're configuring
+		if [ "$app_name" = "$exclude_app" ]; then
+			continue
+		fi
+
+		# Check all domains in this deployfile
+		while IFS= read -r existing_domain; do
+			if [ "$existing_domain" = "$domain" ]; then
 				echo "❌ Domain $domain already used by $app_name"
 				exit 1
 			fi
-		fi
+		done < <(get_conf_all "$deployfile" "domain")
 	done
 }
 
-read_deployfile() {
-	local deployfile=$1
+# Get single value (last occurrence wins)
+get_conf() {
+	local file=$1 key=$2 default=${3:-}
 
-	if [ ! -f "$deployfile" ]; then
+	if [ ! -f "$file" ]; then
+		echo "$default"
+		return
+	fi
+
+	local value
+	value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-)
+
+	if [ -z "$value" ]; then
+		echo "$default"
+	else
+		echo "$value"
+	fi
+}
+
+# Get all values for a key (one per line)
+get_conf_all() {
+	local file=$1 key=$2
+
+	if [ ! -f "$file" ]; then
+		return
+	fi
+
+	grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-
+}
+
+# Validate deployfile has required fields
+validate_deployfile() {
+	local file=$1
+	local app_name=$2
+
+	if [ ! -f "$file" ]; then
 		echo "❌ No deployfile found"
 		exit 1
 	fi
 
-	DEPLOY_START=""
-	DEPLOY_BUILD=""
-	DEPLOY_PORT="7890"
+	# Check if at least one configuration exists (domain, start, etc.)
+	local start_cmd=$(get_conf "$file" "start")
+	local has_domains=$(get_conf_all "$file" "domain" | wc -l)
 
-	while IFS='=' read -r key value; do
-		# skip blank lines and comments
-		[[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-		# trim whitespace
-		key=$(echo "$key" | xargs)
-		value=$(echo "$value" | sed 's/^[[:space:]]*//')
-
-		case "$key" in
-			start) DEPLOY_START="$value" ;;
-			build) DEPLOY_BUILD="$value" ;;
-			port)  DEPLOY_PORT="$value" ;;
-		esac
-	done < "$deployfile"
-
-	if [ -z "$DEPLOY_START" ]; then
-		echo "❌ deployfile missing required \"start\" command"
+	if [ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ]; then
+		echo "❌ deployfile must have either 'start' (for containers) or 'domain' (for static sites)"
 		exit 1
 	fi
 
-	export DEPLOY_START DEPLOY_BUILD DEPLOY_PORT
+	# Validate bind mount syntax: /host:/container[:ro]
+	while IFS= read -r bind; do
+		if ! [[ "$bind" =~ ^/[^:]+:/[^:]+(:ro)?$ ]]; then
+			echo "❌ Invalid bind mount syntax: $bind"
+			echo "   Expected: bind=/host/path:/container/path[:ro]"
+			exit 1
+		fi
+	done < <(get_conf_all "$file" "bind")
+
+	# Validate domain uniqueness
+	while IFS= read -r domain; do
+		check_domain_collision "$domain" "$app_name"
+	done < <(get_conf_all "$file" "domain")
+
+	return 0
 }
 
 # ============================================================================
@@ -226,20 +270,11 @@ cmd_init() {
 
 cmd_create() {
 	if [ -z "$1" ]; then
-		echo "Usage: deploy create <app-name> [--static]"
+		echo "Usage: deploy create <app-name>"
 		exit 1
 	fi
 
 	local app_name=$1
-	local static_mode=false
-
-	# check for --static flag
-	for arg in "$@"; do
-		if [ "$arg" = "--static" ]; then
-			static_mode=true
-		fi
-	done
-
 	local app_dir="$DEPLOY_ROOT/apps/$app_name"
 
 	# check for existing app with name
@@ -268,128 +303,25 @@ cmd_create() {
 	# ensure deploy user owns the app directory
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 
-	if [ "$static_mode" = true ]; then
-		# static site - no container needed
-
-		# create dummy service that does nothing (for consistency)
-		cat > "$app_dir/service.conf" <<-SERVICE
-			[Unit]
-			Description=$app_name (static site)
-			After=network.target
-
-			[Service]
-			Type=oneshot
-			ExecStart=/bin/true
-			RemainAfterExit=yes
-
-			[Install]
-			WantedBy=multi-user.target
-			SERVICE
-
-		ln -sf "$app_dir/service.conf" "/etc/systemd/system/deploy-$app_name.service"
-		systemctl daemon-reload
-
-		echo "✅ Created static site: $app_name"
-		echo
-		echo "Next steps:"
-		echo "  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
-		echo "  git push deploy main"
-		echo "  deploy route $app_name yourdomain.com"
-
-	else
-		# create container
-		echo "🏗️  Creating container..."
-
-		local container_root="$app_dir/container"
-
-		# install debootstrap if needed
-		if ! command -v debootstrap &> /dev/null; then
-			echo "📦 Installing debootstrap..."
-			apt-get update && apt-get install -y debootstrap
-		fi
-
-		# create minimal debian container
-		debootstrap --variant=minbase stable "$container_root" http://deb.debian.org/debian
-
-		# setup machine ID
-		systemd-machine-id-setup --root="$container_root"
-
-		# NOTE: .nspawn file will be created on first deploy when we know the container port
-		# The template service is already available at /etc/systemd/system/deploy@.service
-
-		echo "✅ Created app: $app_name"
-		echo "   Container: $container_root"
-		echo "   Machine: deploy-$app_name"
-		echo
-		echo "Add a deployfile to your repo root:"
-		echo "  start=npm start"
-		echo "  build=npm ci && npm run build"
-		echo "  port=7890"
-		echo
-		echo "Next steps:"
-		echo "  git remote add production $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
-		echo "  git push production main"
-		echo "  deploy route $app_name yourdomain.com"
-	fi
-}
-
-cmd_route() {
-	if [ -z "$1" ] || [ -z "$2" ]; then
-		echo "Usage: deploy route <app-name> <domain>"
-		exit 1
-	fi
-
-	local app_name=$1
-	local domain=$2
-	local app_dir="$DEPLOY_ROOT/apps/$app_name"
-
-	if [ ! -d "$app_dir" ]; then
-		echo "❌ App $app_name does not exist"
-		exit 1
-	fi
-
-	# check for domain collision (including within this app)
-	check_domain_collision "$domain"
-
-	# detect static vs container based on whether a container was created
-	if [ ! -d "$app_dir/container" ]; then
-		local root_dir="$app_dir/current"
-
-		cat >> "$app_dir/caddy.conf" <<-CADDY
-			$domain {
-			    root * $root_dir
-			    file_server
-			    try_files {path} /index.html
-			    encode gzip
-			}
-			CADDY
-
-		echo "✅ Caddy configured for static site"
-		echo "   $domain -> $root_dir"
-
-	else
-		# get container port from deployfile or use default
-		local container_port="7890"
-
-		if [ -f "$app_dir/current/deployfile" ]; then
-			read_deployfile "$app_dir/current/deployfile"
-			container_port="$DEPLOY_PORT"
-		fi
-
-		cat >> "$app_dir/caddy.conf" <<-CADDY
-			$domain {
-			    reverse_proxy http://deploy-$app_name.nspawn:$container_port
-			}
-			CADDY
-
-		echo "✅ Caddy configured for $app_name"
-		echo "   $domain -> http://deploy-$app_name.nspawn:$container_port"
-	fi
-
-	# reload caddy
-	caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile"
-
-	echo "🔒 HTTPS will be automatically provisioned!"
+	echo "✅ Created app: $app_name"
+	echo
+	echo "Add a deployfile to your repo root:"
+	echo
+	echo "  For a container app:"
+	echo "    start=npm start"
+	echo "    build=npm ci && npm run build"
+	echo "    port=3000"
+	echo "    domain=yourdomain.com"
+	echo "    bind=/data/uploads:/app/uploads"
+	echo
+	echo "  For a static site:"
+	echo "    domain=yourdomain.com"
+	echo
+	echo "Next steps:"
+	echo "  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git"
+	echo "  git push deploy main"
+	echo
+	echo "Container will be created automatically on first deploy if 'start=' is present."
 }
 
 cmd_list() {
@@ -423,10 +355,22 @@ cmd_list() {
 			echo "    Machine: deploy-$app_name.nspawn"
 		fi
 
-		# domain
-		if [ -f "$app_dir/caddy.conf" ]; then
-			local domain=$(head -1 "$app_dir/caddy.conf" | awk '{print $1}')
-			echo "    Domain: $domain"
+		# domains from deployfile
+		if [ -f "$app_dir/current/deployfile" ]; then
+			local domains=()
+			while IFS= read -r domain; do
+				domains+=("$domain")
+			done < <(get_conf_all "$app_dir/current/deployfile" "domain")
+
+			if [ ${#domains[@]} -gt 0 ]; then
+				echo "    Domains: ${domains[*]}"
+			fi
+
+			# Show bind mount count
+			local bind_count=$(get_conf_all "$app_dir/current/deployfile" "bind" | wc -l)
+			if [ $bind_count -gt 0 ]; then
+				echo "    Bind mounts: $bind_count"
+			fi
 		fi
 
 		echo
@@ -508,47 +452,6 @@ cmd_remove() {
 	echo "✅ Removed $app_name"
 }
 
-cmd_export() {
-	local output="${1:-deploy-backup-$(date +%Y%m%d-%H%M%S).tar.gz}"
-
-	echo "📤 Exporting to $output..."
-
-	tar --exclude="apps/*/container" \
-		--exclude="apps/*/releases" \
-		-czf "$output" \
-		-C "$DEPLOY_ROOT" \
-		--dereference \
-		.
-
-	echo "✅ Exported to $output"
-	echo "   Note: containers excluded — recreated automatically on next deploy"
-}
-
-cmd_import() {
-	if [ -z "$1" ]; then
-		echo "Usage: deploy import <archive>"
-		exit 1
-	fi
-
-	local archive=$1
-
-	if [ ! -f "$archive" ]; then
-		echo "❌ Archive not found: $archive"
-		exit 1
-	fi
-
-	echo "📥 Importing from $archive..."
-
-	mkdir -p "$DEPLOY_ROOT"
-	tar -xzf "$archive" -C "$DEPLOY_ROOT"
-
-	systemctl daemon-reload
-	caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
-
-	echo "✅ Imported successfully"
-	echo "   Note: redeploy apps to recreate containers"
-}
-
 cmd_shell() {
 	if [ -z "$1" ]; then
 		echo "Usage: deploy shell <app-name>"
@@ -591,68 +494,224 @@ cmd__deploy-app() {
 
 	cd "$release_dir"
 
-	if [ ! -d "$container_root" ]; then
-		# static site — just swap and reload caddy
-		ln -sfn "$release_dir" "$current_link"
-		echo "✅ Deployed to $current_link"
-		caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
-	else
-		# read deployfile
-		read_deployfile "$release_dir/deployfile"
+	# Atomic swap (do this BEFORE sync so deployfile is readable)
+	ln -sfn "$release_dir" "$current_link"
+	echo "✅ Deployed to $current_link"
 
-		local container_port="$DEPLOY_PORT"
+	# Detect if container and run build if needed
+	local deployfile="$release_dir/deployfile"
+	local start_cmd=$(get_conf "$deployfile" "start")
+	local build_cmd=$(get_conf "$deployfile" "build")
 
-		# run build command if present
-		if [ -n "$DEPLOY_BUILD" ]; then
-			echo "🔧 Running build..."
-			systemd-nspawn --directory="$container_root" \
-				--bind="$release_dir":/build \
-				--chdir=/build \
-				bash -c "$DEPLOY_BUILD"
+	# Create container on first deploy if this is a container app
+	if [ -n "$start_cmd" ] && [ ! -d "$container_root" ]; then
+		echo "🏗️  First deploy detected - creating container..."
+
+		# install debootstrap if needed
+		if ! command -v debootstrap &> /dev/null; then
+			echo "📦 Installing debootstrap..."
+			apt-get update && apt-get install -y debootstrap
 		fi
 
-		# atomic swap
-		ln -sfn "$release_dir" "$current_link"
-		echo "✅ Deployed to $current_link"
+		# create minimal debian container
+		debootstrap --variant=minbase stable "$container_root" http://deb.debian.org/debian
 
-		# generate start.sh wrapper
-		cat > "$app_dir/start.sh" <<-STARTSH
-		#!/bin/bash
-		export PORT=$container_port
-		exec $DEPLOY_START
-		STARTSH
-		chmod +x "$app_dir/start.sh"
+		# setup machine ID
+		systemd-machine-id-setup --root="$container_root"
 
-		# generate/update .nspawn configuration
-		cat > "/etc/systemd/nspawn/deploy-$app_name.nspawn" <<-NSPAWN
-			[Exec]
-			Boot=no
-
-			[Files]
-			Bind=$app_dir/current:/app
-			BindReadOnly=$app_dir/start.sh:/app/start.sh
-			BindReadOnly=/etc/resolv.conf
-
-			[Network]
-			Zone=deploy
-			NSPAWN
-
-		systemctl daemon-reload
-
-		# enable service instance if not already enabled
-		if ! systemctl is-enabled "deploy@$app_name.service" &>/dev/null; then
-			systemctl enable "deploy@$app_name.service"
-		fi
-
-		# start/restart service
-		echo "🔄 Restarting $app_name..."
-		systemctl restart "deploy@$app_name"
+		echo "✅ Container created: $container_root"
 	fi
+
+	# Only run build if this is a container (has start command) and has build command
+	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
+		echo "🔧 Running build..."
+		systemd-nspawn --directory="$container_root" \
+			--bind="$release_dir":/build \
+			--chdir=/build \
+			bash -c "$build_cmd"
+	fi
+
+	# Sync derived configs and restart services
+	cmd__sync "$app_name"
 
 	# cleanup old releases (keep last 5)
 	cd "$app_dir/releases"
 	ls -t | tail -n +6 | xargs -r rm -rf
 	echo "🧹 Cleaned up old releases"
+}
+
+# Internal command to sync derived files from deployfile
+cmd__sync() {
+	if [ -z "$1" ]; then
+		echo "Internal error: app name required"
+		exit 1
+	fi
+
+	local app_name=$1
+	local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local deployfile="$app_dir/current/deployfile"
+
+	# Detect if static site (no start command)
+	local start_cmd=$(get_conf "$deployfile" "start")
+	local is_static="false"
+
+	if [ -z "$start_cmd" ]; then
+		is_static="true"
+	fi
+
+	# Validate deployfile
+	validate_deployfile "$deployfile" "$app_name"
+
+	# Read configuration
+	local port=$(get_conf "$deployfile" "port" "7890")
+	local build_cmd=$(get_conf "$deployfile" "build")
+
+	echo "🔄 Syncing configuration for $app_name..."
+
+	# ========================================
+	# Generate Caddy configuration
+	# ========================================
+
+	echo "  📝 Generating Caddy config..."
+
+	# Clear existing caddy.conf
+	> "$app_dir/caddy.conf"
+
+	# Get all domains
+	local domains=()
+	while IFS= read -r domain; do
+		domains+=("$domain")
+	done < <(get_conf_all "$deployfile" "domain")
+
+	# Generate config for each domain
+	if [ ${#domains[@]} -gt 0 ]; then
+		for domain in "${domains[@]}"; do
+			if [ "$is_static" = "true" ]; then
+				# Static site config
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    root * $app_dir/current
+				    file_server
+				    try_files {path} /index.html
+				    encode gzip
+				}
+				CADDY
+			else
+				# Container reverse proxy
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    reverse_proxy http://deploy-$app_name.nspawn:$port
+				}
+				CADDY
+			fi
+		done
+
+		echo "    Configured ${#domains[@]} domain(s): ${domains[*]}"
+	else
+		echo "    No domains configured"
+	fi
+
+	# ========================================
+	# Generate .nspawn configuration
+	# ========================================
+
+	if [ "$is_static" = "false" ]; then
+		echo "  📝 Generating .nspawn config..."
+
+		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
+		local container_root="$app_dir/container"
+
+		cat > "$nspawn_file" <<-NSPAWN
+		[Exec]
+		Boot=no
+
+		[Files]
+		# Default binds
+		Bind=$app_dir/current:/app
+		BindReadOnly=$app_dir/start.sh:/app/start.sh
+		BindReadOnly=/etc/resolv.conf
+
+		NSPAWN
+
+		# Add custom bind mounts
+		local bind_count=0
+		while IFS= read -r bind; do
+			# Parse bind syntax: /host:/container[:ro]
+			local host_path container_path readonly=""
+
+			if [[ "$bind" =~ ^([^:]+):([^:]+):ro$ ]]; then
+				host_path="${BASH_REMATCH[1]}"
+				container_path="${BASH_REMATCH[2]}"
+				readonly="ReadOnly"
+			elif [[ "$bind" =~ ^([^:]+):([^:]+)$ ]]; then
+				host_path="${BASH_REMATCH[1]}"
+				container_path="${BASH_REMATCH[2]}"
+			else
+				echo "⚠️  Skipping invalid bind: $bind"
+				continue
+			fi
+
+			# Ensure host path exists
+			if [ ! -e "$host_path" ]; then
+				echo "⚠️  Host path does not exist: $host_path (creating directory)"
+				mkdir -p "$host_path"
+			fi
+
+			# Write to nspawn file
+			if [ -n "$readonly" ]; then
+				echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
+			else
+				echo "Bind=$host_path:$container_path" >> "$nspawn_file"
+			fi
+
+			((bind_count++))
+		done < <(get_conf_all "$deployfile" "bind")
+
+		# Add network zone
+		cat >> "$nspawn_file" <<-NSPAWN
+
+		[Network]
+		Zone=deploy
+		NSPAWN
+
+		if [ $bind_count -gt 0 ]; then
+			echo "    Added $bind_count custom bind mount(s)"
+		fi
+
+		# Generate start.sh wrapper
+		cat > "$app_dir/start.sh" <<-STARTSH
+		#!/bin/bash
+		export PORT=$port
+		exec $start_cmd
+		STARTSH
+		chmod +x "$app_dir/start.sh"
+	fi
+
+	# ========================================
+	# Reload services
+	# ========================================
+
+	echo "  🔄 Reloading services..."
+
+	# Reload Caddy if domains configured
+	if [ ${#domains[@]} -gt 0 ]; then
+		caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
+	fi
+
+	# Reload systemd and restart container
+	if [ "$is_static" = "false" ]; then
+		systemctl daemon-reload
+
+		# Enable service if not already enabled
+		if ! systemctl is-enabled "deploy@$app_name.service" &>/dev/null; then
+			systemctl enable "deploy@$app_name.service"
+		fi
+
+		# Restart service
+		systemctl restart "deploy@$app_name"
+	fi
+
+	echo "✅ Configuration synced"
 }
 
 # ============================================================================
@@ -665,26 +724,34 @@ cmd_help() {
 
 		Usage:
 		  deploy init                        Initialize the deployment system
-		  deploy create <name> [--static]    Create a new app
-		  deploy route <name> <domain>       Route domain to app
+		  deploy create <name>               Create a new app
 		  deploy list                        List all apps
 		  deploy logs <name> [options...]    Show app logs (journalctl wrapper)
 		  deploy shell <name>                Shell into container
 		  deploy restart <name>              Restart an app
 		  deploy remove <name>               Remove an app
-			deploy export [file]               Export backup archive
-			deploy import <file>               Restore from backup archive
 		  deploy help                        Show this help
 
 		deployfile:
-		  Add a "deployfile" to your repo root to configure builds and runtime.
+		  Add a "deployfile" to your repo root to configure your app.
 
+		  # For containers
 		  start=npm start                # required: the long-running process command
 		  build=npm ci && npm run build  # optional: runs before each deploy
-		  port=7890                      # optional: container port (default: 7890)
+		  port=3000                      # optional: container port (default: 7890)
+
+		  # For all apps (static sites and containers)
+		  domain=example.com             # optional: domain routing (multi-value)
+		  domain=www.example.com         # can specify multiple domains
+
+		  # Bind mounts (containers only, Docker-style syntax)
+		  bind=/data/uploads:/app/uploads          # read-write mount
+		  bind=/etc/secrets:/app/secrets:ro        # read-only mount (:ro)
 
 		  The "start" command receives PORT as an environment variable.
 		  Containers are accessible at: deploy-<app-name>.nspawn:<port>
+
+		  Changes to deployfile take effect on next "git push".
 		HELP
 }
 
@@ -692,15 +759,13 @@ cmd_help() {
 case "${1:-help}" in
 	init)       cmd_init ;;
 	create)     shift; cmd_create "$@" ;;
-	route)      shift; cmd_route "$@" ;;
 	list)       cmd_list ;;
 	logs)       shift; cmd_logs "$@" ;;
 	shell)      shift; cmd_shell "$@" ;;
 	restart)    shift; cmd_restart "$@" ;;
 	remove)     shift; cmd_remove "$@" ;;
-	export)     shift; cmd_export "$@" ;;
-  import)     shift; cmd_import "$@" ;;
 	_deploy-app) shift; cmd__deploy-app "$@" ;;  # internal
+	_sync)      shift; cmd__sync "$@" ;;          # internal
 	help|--help|-h) cmd_help ;;
 	*)
 		echo "Unknown command: $1"
