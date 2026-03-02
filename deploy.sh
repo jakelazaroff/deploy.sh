@@ -28,7 +28,7 @@ require_arg() {
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
-	for deployfile in "$DEPLOY_ROOT"/apps/*/current/deployfile; do
+	for deployfile in "$DEPLOY_ROOT"/apps/*/current/deploy.conf; do
 		[ ! -f "$deployfile" ] && continue
 		local app_name=$(basename "$(dirname "$(dirname "$deployfile")")")
 		[ "$app_name" = "$exclude_app" ] && continue
@@ -53,11 +53,11 @@ get_conf_all() {
 
 validate_deployfile() {
 	local file=$1 app_name=$2
-	[ ! -f "$file" ] && { echo "❌ No deployfile found"; exit 1; }
+	[ ! -f "$file" ] && { echo "❌ No deploy.conf found"; exit 1; }
 
 	local start_cmd=$(get_conf "$file" "start")
 	local has_domains=$(get_conf_all "$file" "domain" | wc -l)
-	[ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ] && { echo "❌ deployfile must have either 'start' (for containers) or 'domain' (for static sites)"; exit 1; }
+	[ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ] && { echo "❌ deploy.conf must have either 'start' (for containers) or 'domain' (for static sites)"; exit 1; }
 
 	while IFS= read -r bind; do
 		[[ "$bind" =~ ^/[^:]+:/[^:]+(:ro)?$ ]] || { echo "❌ Invalid bind mount syntax: $bind"; echo "   Expected: bind=/host/path:/container/path[:ro]"; exit 1; }
@@ -171,7 +171,7 @@ cmd_create() {
 	cat <<-MSG
 	✅ Created app: $app_name
 
-	Add a deployfile to your repo root:
+	Add a deploy.conf to your repo root:
 
 	  For a container app:
 	    start=npm start
@@ -202,9 +202,9 @@ cmd_list() {
 		echo "    Location: $app_dir"
 		systemctl list-unit-files | grep -q "^deploy@.service" && echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"
 		[ -d "$app_dir/container" ] && echo "    Machine: deploy-$app_name.nspawn"
-		if [ -f "$app_dir/current/deployfile" ]; then
-			local domains=$(get_conf_all "$app_dir/current/deployfile" "domain" | tr '\n' ' ')
-			local bind_count=$(get_conf_all "$app_dir/current/deployfile" "bind" | wc -l)
+		if [ -f "$app_dir/current/deploy.conf" ]; then
+			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
+			local bind_count=$(get_conf_all "$app_dir/current/deploy.conf" "bind" | wc -l)
 			[ -n "$domains" ] && echo "    Domains: $domains"
 			[ $bind_count -gt 0 ] && echo "    Bind mounts: $bind_count"
 		fi
@@ -267,7 +267,7 @@ cmd__deploy-app() {
 	ln -sfn "$release_dir" "$current_link"
 	echo "✅ Deployed to $current_link"
 
-	local deployfile="$release_dir/deployfile"
+	local deployfile="$release_dir/deploy.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local build_cmd=$(get_conf "$deployfile" "build")
 
@@ -291,7 +291,7 @@ cmd__deploy-app() {
 
 cmd__sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name" deployfile="$app_dir/current/deployfile"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name" deployfile="$app_dir/current/deploy.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; [ -z "$start_cmd" ] && is_static=true
 	validate_deployfile "$deployfile" "$app_name"
@@ -376,14 +376,14 @@ cmd_help() {
 	  deploy init                        Initialize the deployment system
 	  deploy create <name>               Create a new app
 	  deploy list                        List all apps
-	  deploy logs <name> [options...]    Show app logs (journalctl wrapper)
+	  deploy logs <name> [options...]    Show app logs
 	  deploy shell <name>                Shell into container
 	  deploy restart <name>              Restart an app
 	  deploy remove <name>               Remove an app
 	  deploy help                        Show this help
 
-	deployfile:
-	  Add a "deployfile" to your repo root to configure your app.
+	deploy.conf:
+	  Add a "deploy.conf" to your repo root to configure your app.
 
 	  # For containers
 	  start=npm start                # required: the long-running process command
@@ -401,7 +401,7 @@ cmd_help() {
 	  The "start" command receives PORT as an environment variable.
 	  Containers are accessible at: deploy-<app-name>.nspawn:<port>
 
-	  Changes to deployfile take effect on next "git push".
+	  Changes to deploy.conf take effect on next "git push".
 	HELP
 }
 
