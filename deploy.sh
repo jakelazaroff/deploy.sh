@@ -20,42 +20,42 @@ DEPLOY_USER=deploy
 # Require an argument or exit with usage message
 require_arg() {
 	local arg=$1 usage=$2
-	[ -z "$arg" ] && { echo "$usage"; exit 1; }
+	if [ -z "$arg" ]; then echo "$usage"; exit 1; fi
 }
 
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
 	for deployfile in "$DEPLOY_ROOT"/apps/*/current/deploy.conf; do
-		[ ! -f "$deployfile" ] && continue
+		if [ ! -f "$deployfile" ]; then continue; fi
 		local app_name=$(basename "$(dirname "$(dirname "$deployfile")")")
-		[ "$app_name" = "$exclude_app" ] && continue
+		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
 		while IFS= read -r existing_domain; do
-			[ "$existing_domain" = "$domain" ] && { echo "❌ Domain $domain already used by $app_name"; exit 1; }
+			if [ "$existing_domain" = "$domain" ]; then echo "❌ Domain $domain already used by $app_name"; exit 1; fi
 		done < <(get_conf_all "$deployfile" "domain")
 	done
 }
 
 get_conf() {
 	local file=$1 key=$2 default=${3:-}
-	[ ! -f "$file" ] && { echo "$default"; return; }
+	if [ ! -f "$file" ]; then echo "$default"; return; fi
 	local value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-)
 	echo "${value:-$default}"
 }
 
 get_conf_all() {
 	local file=$1 key=$2
-	[ -f "$file" ] && grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-
+	if [ -f "$file" ]; then grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-; fi
 }
 
 validate_deployconf() {
 	local file=$1 app_name=$2
-	[ ! -f "$file" ] && { echo "❌ No deploy.conf found"; exit 1; }
+	if [ ! -f "$file" ]; then echo "❌ No deploy.conf found"; exit 1; fi
 
 	local start_cmd=$(get_conf "$file" "start")
 	local has_domains=$(get_conf_all "$file" "domain" | wc -l)
-	[ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ] && { echo "❌ deploy.conf must have either 'start' (for containers) or 'domain' (for static sites)"; exit 1; }
+	if [ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ]; then echo "❌ deploy.conf must have either 'start' (for containers) or 'domain' (for static sites)"; exit 1; fi
 
 	while IFS= read -r domain; do
 		check_domain_collision "$domain" "$app_name"
@@ -65,20 +65,37 @@ validate_deployconf() {
 # SUBCOMMANDS
 
 cmd_init() {
-	[ "$(id -u)" -ne 0 ] && { echo "❌ deploy init must be run as root"; exit 1; }
+	if [ "$(id -u)" -ne 0 ]; then echo "❌ deploy init must be run as root"; exit 1; fi
 	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
+
+	if ! command -v systemd-nspawn &>/dev/null; then
+		echo "📦 Installing systemd-container..."
+		if command -v apt-get &>/dev/null; then
+			apt-get install -y systemd-container
+		elif command -v dnf &>/dev/null; then
+			dnf install -y systemd-container
+		else
+			echo "❌ systemd-nspawn not found — install systemd-container manually"; exit 1
+		fi
+	fi
 
 	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; echo "✅ Created user: $DEPLOY_USER"; }
 
-	read -rp "🔑 Public key for SSH access (paste your ~/.ssh/id_*.pub): " public_key
-	if [ -n "$public_key" ]; then
+	local src_keys=""
+	if [ -n "$SUDO_USER" ]; then
+		local src_home; src_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+		if [ -f "$src_home/.ssh/authorized_keys" ]; then src_keys="$src_home/.ssh/authorized_keys"; fi
+	fi
+	if [ -z "$src_keys" ] && [ -f /root/.ssh/authorized_keys ]; then src_keys=/root/.ssh/authorized_keys; fi
+
+	if [ -n "$src_keys" ]; then
 		mkdir -p "/home/$DEPLOY_USER/.ssh"
-		echo "$public_key" >> "/home/$DEPLOY_USER/.ssh/authorized_keys"
+		cp "$src_keys" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 		chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
 		chmod 700 "/home/$DEPLOY_USER/.ssh" && chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
-		echo "✅ Added public key for $DEPLOY_USER"
+		echo "✅ Copied SSH authorized_keys from $src_keys"
 	else
-		echo "⚠️  No public key provided — add it manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
+		echo "⚠️  No authorized_keys found — add your public key manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
 	fi
 
 	mkdir -p "$DEPLOY_ROOT"/{apps,caddy}
@@ -96,7 +113,7 @@ cmd_init() {
 		echo "📦 Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
 		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
-		[ -z "$alpine_file" ] && { echo "❌ Could not find Alpine minirootfs for $arch"; exit 1; }
+		if [ -z "$alpine_file" ]; then echo "❌ Could not find Alpine minirootfs for $arch"; exit 1; fi
 		machinectl pull-tar --verify=no "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" deploy-base
 		echo "🔧 Installing bash in base image..."
 		systemd-nspawn --machine=deploy-base /bin/sh -c "apk update && apk add --no-cache bash"
@@ -107,7 +124,7 @@ cmd_init() {
 
 	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
-		[ -z "$acme_email" ] && { echo "❌ Email is required for HTTPS certificate provisioning"; exit 1; }
+		if [ -z "$acme_email" ]; then echo "❌ Email is required for HTTPS certificate provisioning"; exit 1; fi
 		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
@@ -155,6 +172,7 @@ cmd_init() {
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
+	ALL ALL=(deploy) NOPASSWD: /usr/local/bin/deploy *
 	SUDOERS
 	chmod 0440 /etc/sudoers.d/deploy
 	echo "📝 Created /etc/sudoers.d/deploy"
@@ -164,8 +182,8 @@ cmd_init() {
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
-	[ -d "$app_dir" ] && { echo "❌ App $app_name already exists"; exit 1; }
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	if [ -d "$app_dir" ]; then echo "❌ App $app_name already exists"; exit 1; fi
 
 	echo "📦 Creating app: $app_name"
 	mkdir -p "$app_dir"/{releases,repo.git}
@@ -209,21 +227,21 @@ cmd_create() {
 
 cmd_list() {
 	echo -e "📦 Deployed Apps:\n"
-	[ ! -d "$DEPLOY_ROOT/apps" ] && { echo "  (none)"; return; }
+	if [ ! -d "$DEPLOY_ROOT/apps" ]; then echo "  (none)"; return; fi
 
 	for app_dir in "$DEPLOY_ROOT"/apps/*; do
-		[ ! -d "$app_dir" ] && continue
+		if [ ! -d "$app_dir" ]; then continue; fi
 		local app_name=$(basename "$app_dir")
 		echo "  $app_name"
 		echo "    Location: $app_dir"
-		systemctl list-unit-files | grep -q "^deploy@.service" && echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"
-		[ -d "$app_dir/container" ] && echo "    Machine: deploy-$app_name.nspawn"
+		if systemctl list-unit-files | grep -q "^deploy@.service"; then echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"; fi
+		if [ -d "$app_dir/container" ]; then echo "    Machine: deploy-$app_name.nspawn"; fi
 		if [ -f "$app_dir/current/deploy.conf" ]; then
 			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
-			[ -n "$domains" ] && echo "    Domains: $domains"
+			if [ -n "$domains" ]; then echo "    Domains: $domains"; fi
 		fi
 		local mount_count=$(get_conf_all "$app_dir/server.conf" "mount" | wc -l)
-		[ "$mount_count" -gt 0 ] && echo "    Mounts: $mount_count"
+		if [ "$mount_count" -gt 0 ]; then echo "    Mounts: $mount_count"; fi
 		echo
 	done
 }
@@ -235,12 +253,22 @@ Examples:
   deploy logs myapi
   deploy logs myapi -f
   deploy logs myapi --since '1 hour ago'"
+	sudo "$0" _logs "$@"
+}
+
+cmd__logs() {
+	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; shift
 	journalctl -u "deploy@$app_name" "$@"
 }
 
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
+	sudo "$0" _restart "$1"
+}
+
+cmd__restart() {
+	require_arg "$1" "Internal error: app name required"
 	echo "🔄 Restarting $1..."
 	systemctl restart "deploy@$1"
 	echo "✅ Restarted"
@@ -248,29 +276,39 @@ cmd_restart() {
 
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
-	[ ! -d "$app_dir" ] && { echo "❌ App $app_name does not exist"; exit 1; }
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	if [ ! -d "$app_dir" ]; then echo "❌ App $app_name does not exist"; exit 1; fi
+	sudo "$0" _remove "$app_name"
+}
 
+cmd__remove() {
+	require_arg "$1" "Internal error: app name required"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
 	echo "🗑️  Removing app: $app_name"
-	systemctl is-active --quiet "deploy@$app_name" 2>/dev/null && { echo "  Stopping service..."; systemctl stop "deploy@$app_name"; }
-	systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null && systemctl disable "deploy@$app_name"
-	[ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ] && { rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; }
-	[ -d "/var/lib/machines/deploy-$app_name" ] && { echo "  Removing container image..."; machinectl remove "deploy-$app_name"; }
-	[ -f "$app_dir/caddy.conf" ] && { echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true; }
+	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping service..."; systemctl stop "deploy@$app_name"; fi
+	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
+	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
+	if [ -d "/var/lib/machines/deploy-$app_name" ]; then echo "  Removing container image..."; machinectl remove "deploy-$app_name"; fi
+	if [ -f "$app_dir/caddy.conf" ]; then echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true; fi
 	echo "  Removing app files..." && rm -rf "$app_dir"
 	echo "✅ Removed $app_name"
 }
 
 cmd_shell() {
 	require_arg "$1" "Usage: deploy shell <app-name>"
-	[ ! -d "/var/lib/machines/deploy-$1" ] && { echo "❌ Container for $1 does not exist"; exit 1; }
+	if [ ! -d "/var/lib/machines/deploy-$1" ]; then echo "❌ Container for $1 does not exist"; exit 1; fi
+	sudo "$0" _shell "$1"
+}
+
+cmd__shell() {
+	require_arg "$1" "Internal error: app name required"
 	echo "🐚 Entering container for $1..."
 	systemd-nspawn --machine="deploy-$1"
 }
 
 cmd__deploy-app() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
@@ -320,10 +358,10 @@ cmd__deploy-app() {
 
 cmd__sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
-	local is_static=false; [ -z "$start_cmd" ] && is_static=true
+	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
 	validate_deployconf "$deployfile" "$app_name"
 	local port=$(get_conf "$deployfile" "port" "7890")
 
@@ -338,20 +376,15 @@ cmd__sync() {
 	for domain in "${domains[@]}"; do
 		if $is_static; then
 			local root_path="$app_dir/current"
-			[ -n "$static_dir" ] && root_path="$app_dir/current/$static_dir"
+			if [ -n "$static_dir" ]; then root_path="$app_dir/current/$static_dir"; fi
 
 			if [ "$spa_mode" = "true" ]; then
 				cat >> "$app_dir/caddy.conf" <<-CADDY
 				$domain {
 				    root * $root_path
-				    encode gzip
-
-				    @notFile {
-				        not file
-				        not path */
-				    }
-				    rewrite @notFile /index.html
+				    try_files {path} /index.html
 				    file_server
+				    encode gzip
 				}
 				CADDY
 			else
@@ -359,7 +392,6 @@ cmd__sync() {
 				$domain {
 				    root * $root_path
 				    file_server
-				    try_files {path} /index.html
 				    encode gzip
 				}
 				CADDY
@@ -387,8 +419,8 @@ cmd__sync() {
 		fi
 	done
 	[ ${#domains[@]} -gt 0 ] && echo "    Configured ${#domains[@]} domain(s): ${domains[*]}" || echo "    No domains configured"
-	[ -n "$static_dir" ] && echo "    Assets directory: $static_dir"
-	[ "$spa_mode" = "true" ] && echo "    SPA mode: enabled"
+	if [ -n "$static_dir" ]; then echo "    Assets directory: $static_dir"; fi
+	if [ "$spa_mode" = "true" ]; then echo "    SPA mode: enabled"; fi
 
 	if ! $is_static; then
 		echo "  📝 Generating .nspawn config..."
@@ -420,14 +452,14 @@ cmd__sync() {
 			else
 				echo "⚠️  Skipping invalid mount: $mount"; continue
 			fi
-			[ ! -e "$host_path" ] && { echo "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
+			if [ ! -e "$host_path" ]; then echo "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; fi
 			echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
 			((mount_count++))
 		done < <(get_conf_all "$app_conf" "mount")
 
 		echo -e "\n[Network]\nZone=deploy" >> "$nspawn_file"
-		[ "$mount_count" -gt 0 ] && echo "    Added $mount_count custom mount(s)"
-		[ "$env_count" -gt 0 ] && echo "    Added $env_count environment variable(s)"
+		if [ "$mount_count" -gt 0 ]; then echo "    Added $mount_count custom mount(s)"; fi
+		if [ "$env_count" -gt 0 ]; then echo "    Added $env_count environment variable(s)"; fi
 
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
@@ -448,26 +480,26 @@ cmd__sync() {
 }
 
 cmd_uninstall() {
-	[ "$(id -u)" -ne 0 ] && { echo "❌ deploy uninstall must be run as root"; exit 1; }
+	if [ "$(id -u)" -ne 0 ]; then echo "❌ deploy uninstall must be run as root"; exit 1; fi
 	echo "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
 	read -rp "Type 'yes' to confirm: " confirm
-	[ "$confirm" != "yes" ] && { echo "Aborted."; exit 1; }
+	if [ "$confirm" != "yes" ]; then echo "Aborted."; exit 1; fi
 
 	echo "🗑️  Uninstalling deploy.sh..."
 
 	for app_dir in "$DEPLOY_ROOT"/apps/*/; do
-		[ ! -d "$app_dir" ] && continue
+		if [ ! -d "$app_dir" ]; then continue; fi
 		local app_name=$(basename "$app_dir")
-		systemctl is-active --quiet "deploy@$app_name" 2>/dev/null && { echo "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; }
-		systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null && systemctl disable "deploy@$app_name"
-		[ -d "/var/lib/machines/deploy-$app_name" ] && machinectl remove "deploy-$app_name"
+		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
+		if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
+		if [ -d "/var/lib/machines/deploy-$app_name" ]; then rm -rf "/var/lib/machines/deploy-$app_name"; fi
 	done
 	rm -f /etc/systemd/nspawn/deploy-*.nspawn
 
-	[ -d /var/lib/machines/deploy-base ] && machinectl remove deploy-base
+	if [ -d /var/lib/machines/deploy-base ]; then rm -rf /var/lib/machines/deploy-base; fi
 
-	systemctl is-active --quiet caddy 2>/dev/null && { echo "  Stopping caddy..."; systemctl stop caddy; }
-	systemctl is-enabled --quiet caddy 2>/dev/null && systemctl disable caddy
+	if systemctl is-active --quiet caddy 2>/dev/null; then echo "  Stopping caddy..."; systemctl stop caddy; fi
+	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
 	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
 
 	rm -f /etc/systemd/system/deploy@.service
@@ -480,7 +512,7 @@ cmd_uninstall() {
 	fi
 
 	rm -rf "$DEPLOY_ROOT"
-	id "$DEPLOY_USER" &>/dev/null && userdel -r "$DEPLOY_USER"
+	if id "$DEPLOY_USER" &>/dev/null; then userdel -r "$DEPLOY_USER"; fi
 
 	echo "✅ Uninstalled"
 }
@@ -502,6 +534,15 @@ cmd_help() {
 	HELP
 }
 
+case "${1:-}" in
+	init|uninstall|_*|help|--help|-h|"") ;;
+	*)
+		if [ "$(id -un)" != "$DEPLOY_USER" ] && [ "$(id -u)" -ne 0 ]; then
+			exec sudo -u "$DEPLOY_USER" "$0" "$@"
+		fi
+		;;
+esac
+
 case "${1:-help}" in
 	init)            cmd_init ;;
 	create)          shift; cmd_create "$@" ;;
@@ -513,6 +554,10 @@ case "${1:-help}" in
 	uninstall)       cmd_uninstall ;;
 	_deploy-app)     shift; cmd__deploy-app "$@" ;;
 	_sync)           shift; cmd__sync "$@" ;;
+	_logs)           shift; cmd__logs "$@" ;;
+	_restart)        shift; cmd__restart "$@" ;;
+	_remove)         shift; cmd__remove "$@" ;;
+	_shell)          shift; cmd__shell "$@" ;;
 	help|--help|-h)  cmd_help ;;
 	*)               echo "Unknown command: $1"; echo "Run \"deploy help\" for usage"; exit 1 ;;
 esac
