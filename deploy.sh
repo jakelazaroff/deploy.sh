@@ -91,6 +91,17 @@ cmd_init() {
 	fi
 	systemctl enable systemd-machined 2>/dev/null || true
 
+	if [ ! -d /var/lib/machines/deploy-base ]; then
+		echo "📦 Pulling Alpine base image..."
+		local arch; arch=$(uname -m)
+		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
+		[ -z "$alpine_file" ] && { echo "❌ Could not find Alpine minirootfs for $arch"; exit 1; }
+		machinectl pull-tar --verify=no "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" deploy-base
+		echo "🔧 Installing bash in base image..."
+		systemd-nspawn --machine=deploy-base /bin/sh -c "apk update && apk add --no-cache bash"
+		echo "✅ Base image ready"
+	fi
+
 	command -v caddy &>/dev/null || { echo "📦 Installing Caddy..."; curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy; chmod +x /usr/local/bin/caddy; }
 
 	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
@@ -132,7 +143,7 @@ cmd_init() {
 
 	[Service]
 	Type=notify
-	ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override --machine=deploy-%i --directory=$DEPLOY_ROOT/apps/%i/container
+	ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override --machine=deploy-%i
 	Restart=always
 	KillMode=mixed
 
@@ -237,6 +248,7 @@ cmd_remove() {
 	systemctl is-active --quiet "deploy@$app_name" 2>/dev/null && { echo "  Stopping service..."; systemctl stop "deploy@$app_name"; }
 	systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null && systemctl disable "deploy@$app_name"
 	[ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ] && { rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; }
+	[ -d "/var/lib/machines/deploy-$app_name" ] && { echo "  Removing container image..."; machinectl remove "deploy-$app_name"; }
 	[ -f "$app_dir/caddy.conf" ] && { echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true; }
 	echo "  Removing app files..." && rm -rf "$app_dir"
 	echo "✅ Removed $app_name"
@@ -244,17 +256,16 @@ cmd_remove() {
 
 cmd_shell() {
 	require_arg "$1" "Usage: deploy shell <app-name>"
-	local container_root="$DEPLOY_ROOT/apps/$1/container"
-	[ ! -d "$container_root" ] && { echo "❌ Container for $1 does not exist"; exit 1; }
+	[ ! -d "/var/lib/machines/deploy-$1" ] && { echo "❌ Container for $1 does not exist"; exit 1; }
 	echo "🐚 Entering container for $1..."
-	systemd-nspawn --directory="$container_root"
+	systemd-nspawn --machine="deploy-$1"
 }
 
 cmd__deploy-app() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
-	local current_link="$app_dir/current" container_root="$app_dir/container"
+	local current_link="$app_dir/current"
 
 	echo "📦 Deploying $app_name..."
 	mkdir -p "$release_dir"
@@ -269,12 +280,12 @@ cmd__deploy-app() {
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local build_cmd=$(get_conf "$deployfile" "build")
 
-	if [ -n "$start_cmd" ] && [ ! -d "$container_root" ]; then
-		echo "🏗️  First deploy detected - creating container..."
-		command -v debootstrap &>/dev/null || { echo "📦 Installing debootstrap..."; apt-get update && apt-get install -y debootstrap; }
-		debootstrap --variant=minbase stable "$container_root" http://deb.debian.org/debian
-		systemd-machine-id-setup --root="$container_root"
-		echo "✅ Container created: $container_root"
+	if [ -n "$start_cmd" ] && [ ! -d "/var/lib/machines/deploy-$app_name" ]; then
+		echo "🏗️  First deploy detected - cloning base image..."
+		machinectl clone deploy-base "deploy-$app_name"
+		rm -f "/var/lib/machines/deploy-$app_name/etc/machine-id"
+		systemd-machine-id-setup --root="/var/lib/machines/deploy-$app_name"
+		echo "✅ Container created"
 	fi
 
 	local app_conf="$app_dir/server.conf"
@@ -285,21 +296,13 @@ cmd__deploy-app() {
 
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running build..."
-		systemd-nspawn --directory="$container_root" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		systemd-nspawn --machine="deploy-$app_name" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
 	elif [ -z "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running static site build in ephemeral container..."
-		local build_container="$app_dir/build-container"
-
-		if [ ! -d "$build_container" ]; then
-			echo "  Creating build container..."
-			command -v debootstrap &>/dev/null || { echo "📦 Installing debootstrap..."; apt-get update && apt-get install -y debootstrap; }
-			debootstrap --variant=minbase stable "$build_container" http://deb.debian.org/debian
-		fi
-
-		systemd-nspawn --directory="$build_container" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-
-		echo "  Cleaning up build container..."
-		rm -rf "$build_container"
+		local build_machine="deploy-${app_name}-build"
+		machinectl clone deploy-base "$build_machine"
+		systemd-nspawn --machine="$build_machine" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		machinectl remove "$build_machine"
 		echo "✅ Build complete"
 	fi
 
