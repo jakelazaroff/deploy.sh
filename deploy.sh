@@ -15,9 +15,7 @@ set -e
 DEPLOY_ROOT=${DEPLOY_ROOT:-/srv/deploy}
 DEPLOY_USER=${DEPLOY_USER:-deploy}
 
-# ============================================================================
 # UTILITIES
-# ============================================================================
 
 # Require an argument or exit with usage message
 require_arg() {
@@ -51,7 +49,7 @@ get_conf_all() {
 	[ -f "$file" ] && grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-
 }
 
-validate_deployfile() {
+validate_deployconf() {
 	local file=$1 app_name=$2
 	[ ! -f "$file" ] && { echo "❌ No deploy.conf found"; exit 1; }
 
@@ -64,9 +62,7 @@ validate_deployfile() {
 	done < <(get_conf_all "$file" "domain")
 }
 
-# ============================================================================
 # SUBCOMMANDS
-# ============================================================================
 
 cmd_init() {
 	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
@@ -186,8 +182,6 @@ cmd_create() {
 	  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git
 	  git push deploy main
 
-	Container will be created automatically on first deploy if 'start=' is present.
-
 	To configure mounts or environment variables, create $app_dir/server.conf on the server:
 	  mount=/data/uploads:/app/uploads    # read-write mount
 	  mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
@@ -208,10 +202,10 @@ cmd_list() {
 		[ -d "$app_dir/container" ] && echo "    Machine: deploy-$app_name.nspawn"
 		if [ -f "$app_dir/current/deploy.conf" ]; then
 			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
-					[ -n "$domains" ] && echo "    Domains: $domains"
+			[ -n "$domains" ] && echo "    Domains: $domains"
 		fi
 		local mount_count=$(get_conf_all "$app_dir/server.conf" "mount" | wc -l)
-		[ $mount_count -gt 0 ] && echo "    Mounts: $mount_count"
+		[ "$mount_count" -gt 0 ] && echo "    Mounts: $mount_count"
 		echo
 	done
 }
@@ -283,10 +277,11 @@ cmd__deploy-app() {
 		echo "✅ Container created: $container_root"
 	fi
 
+	local app_conf="$app_dir/server.conf"
 	local setenv_args=()
 	while IFS= read -r env_var; do
 		setenv_args+=(--setenv="$env_var")
-	done < <(get_conf_all "$app_dir/server.conf" "env")
+	done < <(get_conf_all "$app_conf" "env")
 
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running build..."
@@ -315,10 +310,11 @@ cmd__deploy-app() {
 
 cmd__sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name" deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; [ -z "$start_cmd" ] && is_static=true
-	validate_deployfile "$deployfile" "$app_name"
+	validate_deployconf "$deployfile" "$app_name"
 	local port=$(get_conf "$deployfile" "port" "7890")
 
 	echo "🔄 Syncing configuration for $app_name..."
@@ -392,7 +388,7 @@ cmd__sync() {
 		local env_count=0
 		while IFS= read -r env_var; do
 			echo "Environment=\"$env_var\"" >> "$nspawn_file"
-			((++env_count))
+			((env_count++))
 		done < <(get_conf_all "$app_conf" "env")
 
 		cat >> "$nspawn_file" <<-NSPAWN
@@ -416,12 +412,12 @@ cmd__sync() {
 			fi
 			[ ! -e "$host_path" ] && { echo "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
 			echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
-			((++mount_count))
+			((mount_count++))
 		done < <(get_conf_all "$app_conf" "mount")
 
 		echo -e "\n[Network]\nZone=deploy" >> "$nspawn_file"
-		[ $mount_count -gt 0 ] && echo "    Added $mount_count custom mount(s)"
-		[ $env_count -gt 0 ] && echo "    Added $env_count environment variable(s)"
+		[ "$mount_count" -gt 0 ] && echo "    Added $mount_count custom mount(s)"
+		[ "$env_count" -gt 0 ] && echo "    Added $env_count environment variable(s)"
 
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
@@ -454,39 +450,6 @@ cmd_help() {
 	  deploy restart <name>              Restart an app
 	  deploy remove <name>               Remove an app
 	  deploy help                        Show this help
-
-	deploy.conf:
-	  Add a "deploy.conf" to your repo root to configure your app.
-
-	  # For static sites
-	  build=npm ci && npm run build      # optional: build in ephemeral container before deploy
-	  assets=dist                        # optional: assets directory (default: repo root)
-	  spa=true                           # optional: single-page app mode (serve /index.html with 200 for non-files)
-
-	  # For containers
-	  start=npm start                    # required: the long-running process command
-	  build=npm ci && npm run build      # optional: runs before each deploy
-	  port=3000                          # optional: container port (default: 7890)
-	  assets=public                      # optional: serve assets before proxying
-
-	  # For all apps (static sites and containers)
-	  domain=example.com                 # optional: domain routing (multi-value)
-	  domain=www.example.com             # can specify multiple domains
-
-	  The "start" command receives PORT as an environment variable.
-	  Containers are accessible at: deploy-<app-name>.nspawn:<port>
-
-	  Changes to deploy.conf take effect on next "git push".
-
-	server.conf (server-side, at $DEPLOY_ROOT/apps/<name>/server.conf):
-	  Configure mounts and environment variables here — not in the repo.
-
-	  mount=/data/uploads:/app/uploads    # read-write mount
-	  mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
-	  env=SECRET_KEY=...                  # environment variable
-	  env=DATABASE_URL=postgres://...     # passed to container and build commands
-
-	  Changes to server.conf take effect on next "git push" or "deploy _sync <name>".
 	HELP
 }
 

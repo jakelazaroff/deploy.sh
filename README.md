@@ -33,29 +33,57 @@ The reason for the two files is that `deploy.conf` contains configuration for de
 
 ```conf
 # For static sites
-build=npm ci && npm run build      # optional: build in ephemeral container before deploy
-assets=dist                        # optional: assets directory (default: repo root)
-spa=true                           # optional: single-page app mode (serve /index.html with 200 for non-files)
+# ----------------
+
+# optional: build in ephemeral container before deploy
+build=npm ci && npm run build
+
+# optional: assets directory (default: repo root)
+assets=dist
+
+# optional: single-page app mode (serve /index.html with 200 for non-files)
+spa=true
 
 # For containers
-start=npm start                    # required: the long-running process command
-build=npm ci && npm run build      # optional: runs before each deploy
-port=3000                          # optional: container port (default: 7890)
-assets=public                      # optional: serve assets before proxying
+# --------------
+
+# required: the long-running process command
+start=npm start
+
+# optional: runs before each deploy
+build=npm ci && npm run build
+
+# optional: container port (default: 7890)
+port=3000
+
+# optional: serve assets before proxying
+assets=public
 
 # For all apps (static sites and containers)
-domain=example.com                 # optional: domain routing (multi-value)
-domain=www.example.com             # can specify multiple domains
+# ------------------------------------------
+
+# optional: domain routing (multi-value)
+domain=example.com
+
+# can specify multiple domains
+domain=www.example.com
 ```
 
 The `start` command receives `PORT` as an environment variable. Containers are accessible at `deploy-<app-name>.nspawn:<port>`.
 
+Changes to deploy.conf take effect on next `git push`.
+
 ### server.conf
 
-
 ```conf
-mount=/data/uploads:/app/uploads    # read-write mount
-mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
-env=SECRET_KEY=...                   # environment variable
-env=DATABASE_URL=postgres://...      # passed to container and build commands
+# read-write mount
+mount=/data/uploads:/app/uploads
+
+# read-only mount (:ro)
+mount=/etc/secrets:/app/secrets:ro
+
+# environment variable
+env=SECRET_KEY=...
 ```
+
+Changes to server.conf take effect on next `git push` or `deploy _sync <name>`.
