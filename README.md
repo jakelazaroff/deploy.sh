@@ -33,13 +33,21 @@ start=npm start                    # required: the long-running process command
 build=npm ci && npm run build      # optional: runs before each deploy
 port=3000                          # optional: container port (default: 7890)
 assets=public                      # optional: serve assets before proxying
-bind=/data/uploads:/app/uploads    # read-write mount
-bind=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
 
 # For all apps (static sites and containers)
 domain=example.com                 # optional: domain routing (multi-value)
 domain=www.example.com             # can specify multiple domains
+```
 
-The "start" command receives PORT as an environment variable.
-Containers are accessible at: deploy-<app-name>.nspawn:<port>
-	```
+The `start` command receives `PORT` as an environment variable. Containers are accessible at `deploy-<app-name>.nspawn:<port>`.
+
+## app.conf
+
+Mounts and environment variables are configured in a server-side `app.conf` file at `/srv/deploy/apps/<name>/app.conf`. Because this file lives on the server rather than in the repo, it's the right place for secrets and host filesystem access — app authors can't change it with a `git push`.
+
+```conf
+mount=/data/uploads:/app/uploads    # read-write mount
+mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
+env=SECRET_KEY=...                   # environment variable
+env=DATABASE_URL=postgres://...      # passed to container and build commands
+```
