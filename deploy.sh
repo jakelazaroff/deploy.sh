@@ -12,8 +12,8 @@
 
 set -e
 
-DEPLOY_ROOT=${DEPLOY_ROOT:-/srv/deploy}
-DEPLOY_USER=${DEPLOY_USER:-deploy}
+DEPLOY_ROOT=/srv/deploy
+DEPLOY_USER=deploy
 
 # UTILITIES
 
@@ -65,6 +65,7 @@ validate_deployconf() {
 # SUBCOMMANDS
 
 cmd_init() {
+	[ "$(id -u)" -ne 0 ] && { echo "❌ deploy init must be run as root"; exit 1; }
 	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; echo "✅ Created user: $DEPLOY_USER"; }
@@ -152,6 +153,12 @@ cmd_init() {
 	SERVICE
 	echo "📝 Created deploy@.service template"
 
+	cat > /etc/sudoers.d/deploy <<-SUDOERS
+	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
+	SUDOERS
+	chmod 0440 /etc/sudoers.d/deploy
+	echo "📝 Created /etc/sudoers.d/deploy"
+
 	echo -e "\n✅ System initialized!\n   Location: $DEPLOY_ROOT\n\nNext: deploy create <app-name>"
 }
 
@@ -166,7 +173,7 @@ cmd_create() {
 
 	cat > hooks/post-receive <<-HOOK
 	#!/bin/bash
-	/usr/local/bin/deploy _deploy-app $app_name
+	sudo /usr/local/bin/deploy _deploy-app $app_name
 	HOOK
 	chmod +x hooks/post-receive
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
@@ -440,6 +447,44 @@ cmd__sync() {
 	echo "✅ Configuration synced"
 }
 
+cmd_uninstall() {
+	[ "$(id -u)" -ne 0 ] && { echo "❌ deploy uninstall must be run as root"; exit 1; }
+	echo "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
+	read -rp "Type 'yes' to confirm: " confirm
+	[ "$confirm" != "yes" ] && { echo "Aborted."; exit 1; }
+
+	echo "🗑️  Uninstalling deploy.sh..."
+
+	for app_dir in "$DEPLOY_ROOT"/apps/*/; do
+		[ ! -d "$app_dir" ] && continue
+		local app_name=$(basename "$app_dir")
+		systemctl is-active --quiet "deploy@$app_name" 2>/dev/null && { echo "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; }
+		systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null && systemctl disable "deploy@$app_name"
+		[ -d "/var/lib/machines/deploy-$app_name" ] && machinectl remove "deploy-$app_name"
+	done
+	rm -f /etc/systemd/nspawn/deploy-*.nspawn
+
+	[ -d /var/lib/machines/deploy-base ] && machinectl remove deploy-base
+
+	systemctl is-active --quiet caddy 2>/dev/null && { echo "  Stopping caddy..."; systemctl stop caddy; }
+	systemctl is-enabled --quiet caddy 2>/dev/null && systemctl disable caddy
+	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
+
+	rm -f /etc/systemd/system/deploy@.service
+	rm -f /etc/sudoers.d/deploy
+	systemctl daemon-reload
+
+	if [ -f /etc/nsswitch.conf.backup ]; then
+		mv /etc/nsswitch.conf.backup /etc/nsswitch.conf
+		echo "  Restored /etc/nsswitch.conf"
+	fi
+
+	rm -rf "$DEPLOY_ROOT"
+	id "$DEPLOY_USER" &>/dev/null && userdel -r "$DEPLOY_USER"
+
+	echo "✅ Uninstalled"
+}
+
 cmd_help() {
 	cat <<-HELP
 	🚀 deploy.sh
@@ -452,6 +497,7 @@ cmd_help() {
 	  deploy shell <name>                Shell into container
 	  deploy restart <name>              Restart an app
 	  deploy remove <name>               Remove an app
+	  deploy uninstall                   Remove all deploy.sh system changes
 	  deploy help                        Show this help
 	HELP
 }
@@ -464,6 +510,7 @@ case "${1:-help}" in
 	shell)           shift; cmd_shell "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
+	uninstall)       cmd_uninstall ;;
 	_deploy-app)     shift; cmd__deploy-app "$@" ;;
 	_sync)           shift; cmd__sync "$@" ;;
 	help|--help|-h)  cmd_help ;;
