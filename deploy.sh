@@ -188,7 +188,7 @@ cmd_create() {
 
 	Container will be created automatically on first deploy if 'start=' is present.
 
-	To configure mounts or environment variables, create $app_dir/app.conf on the server:
+	To configure mounts or environment variables, create $app_dir/server.conf on the server:
 	  mount=/data/uploads:/app/uploads    # read-write mount
 	  mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
 	  env=SECRET_KEY=...                  # environment variable (passed to container and build)
@@ -210,7 +210,7 @@ cmd_list() {
 			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
 					[ -n "$domains" ] && echo "    Domains: $domains"
 		fi
-		local mount_count=$(get_conf_all "$app_dir/app.conf" "mount" | wc -l)
+		local mount_count=$(get_conf_all "$app_dir/server.conf" "mount" | wc -l)
 		[ $mount_count -gt 0 ] && echo "    Mounts: $mount_count"
 		echo
 	done
@@ -286,7 +286,7 @@ cmd__deploy-app() {
 	local setenv_args=()
 	while IFS= read -r env_var; do
 		setenv_args+=(--setenv="$env_var")
-	done < <(get_conf_all "$app_dir/app.conf" "env")
+	done < <(get_conf_all "$app_dir/server.conf" "env")
 
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running build..."
@@ -315,7 +315,7 @@ cmd__deploy-app() {
 
 cmd__sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name" deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/app.conf"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/apps/$app_name" deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; [ -z "$start_cmd" ] && is_static=true
 	validate_deployfile "$deployfile" "$app_name"
@@ -478,7 +478,7 @@ cmd_help() {
 
 	  Changes to deploy.conf take effect on next "git push".
 
-	app.conf (server-side, at $DEPLOY_ROOT/apps/<name>/app.conf):
+	server.conf (server-side, at $DEPLOY_ROOT/apps/<name>/server.conf):
 	  Configure mounts and environment variables here — not in the repo.
 
 	  mount=/data/uploads:/app/uploads    # read-write mount
@@ -486,7 +486,7 @@ cmd_help() {
 	  env=SECRET_KEY=...                  # environment variable
 	  env=DATABASE_URL=postgres://...     # passed to container and build commands
 
-	  Changes to app.conf take effect on next "git push" or "deploy _sync <name>".
+	  Changes to server.conf take effect on next "git push" or "deploy _sync <name>".
 	HELP
 }
 

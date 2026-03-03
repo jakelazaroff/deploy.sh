@@ -18,9 +18,18 @@ On the other hand, deploy.sh is a single ~400 line shell script that you can rea
 
 [^nginx]: Why Caddy over something like nginx, which _is_ preinstalled on most Linux systems? nginx doesn't support automatic TLS certificate renewal out of the box. Since we'd need to install a package either way, we use Caddy for a more integrated web server.
 
-## deploy.conf
+## Configuration
 
-You configure the deployment by placing a `deploy.conf` file in your repo root.
+App configuration is in two main files:
+
+- `deploy.conf` should be placed at the root of your repo, and contains instructions for deploying your app.
+- `server.conf` resides on the server at `/srv/deploy/apps/<name>/server.conf`, and contains sensitive server-specific information.
+
+Both files use `key=value` syntax. Repeated keys are allowed. Lines beginning with `#` are comments.
+
+The reason for the two files is that `deploy.conf` contains configuration for deploying your app on _any_ server, whereas `server.conf` contains additional configuration for _your specific_ `deploy.sh` server.
+
+### deploy.conf
 
 ```conf
 # For static sites
@@ -41,9 +50,8 @@ domain=www.example.com             # can specify multiple domains
 
 The `start` command receives `PORT` as an environment variable. Containers are accessible at `deploy-<app-name>.nspawn:<port>`.
 
-## app.conf
+### server.conf
 
-Mounts and environment variables are configured in a server-side `app.conf` file at `/srv/deploy/apps/<name>/app.conf`. Because this file lives on the server rather than in the repo, it's the right place for secrets and host filesystem access — app authors can't change it with a `git push`.
 
 ```conf
 mount=/data/uploads:/app/uploads    # read-write mount
