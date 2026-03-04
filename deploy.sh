@@ -26,7 +26,7 @@ require_arg() {
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
-	for deployfile in "$DEPLOY_ROOT"/apps/*/current/deploy.conf; do
+	for deployfile in "$DEPLOY_ROOT"/*/current/deploy.conf; do
 		if [ ! -f "$deployfile" ]; then continue; fi
 		local app_name=$(basename "$(dirname "$(dirname "$deployfile")")")
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
@@ -98,7 +98,7 @@ cmd_init() {
 		echo "⚠️  No authorized_keys found — add your public key manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
 	fi
 
-	mkdir -p "$DEPLOY_ROOT"/{apps,caddy}
+	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
 	if ! grep -q "mymachines" /etc/nsswitch.conf 2>/dev/null; then
@@ -109,28 +109,29 @@ cmd_init() {
 	fi
 	systemctl enable systemd-machined 2>/dev/null || true
 
-	if [ ! -d /var/lib/machines/deploy-base ]; then
+	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
 		echo "📦 Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
 		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
 		if [ -z "$alpine_file" ]; then echo "❌ Could not find Alpine minirootfs for $arch"; exit 1; fi
-		machinectl pull-tar --verify=no "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" deploy-base
+		mkdir -p "$DEPLOY_ROOT/.internal/machine"
+		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
 		echo "🔧 Installing bash in base image..."
-		systemd-nspawn --machine=deploy-base /bin/sh -c "apk update && apk add --no-cache bash"
+		systemd-nspawn -D "$DEPLOY_ROOT/.internal/machine" /bin/sh -c "apk update && apk add --no-cache bash"
 		echo "✅ Base image ready"
 	fi
 
 	command -v caddy &>/dev/null || { echo "📦 Installing Caddy..."; curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy; chmod +x /usr/local/bin/caddy; }
 
-	if [ ! -f "$DEPLOY_ROOT/caddy/Caddyfile" ]; then
+	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then echo "❌ Email is required for HTTPS certificate provisioning"; exit 1; fi
-		cat > "$DEPLOY_ROOT/caddy/Caddyfile" <<-CADDY
+		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
 		}
 
-		import /srv/deploy/apps/*/caddy.conf
+		import $DEPLOY_ROOT/*/caddy.conf
 		CADDY
 		echo "📝 Created Caddyfile"
 	fi
@@ -143,8 +144,8 @@ cmd_init() {
 	[Service]
 	Type=notify
 	User=root
-	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/caddy/Caddyfile
-	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/caddy/Caddyfile
+	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/.internal/Caddyfile
+	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/.internal/Caddyfile
 	Restart=on-failure
 
 	[Install]
@@ -161,7 +162,7 @@ cmd_init() {
 
 	[Service]
 	Type=notify
-	ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override --machine=deploy-%i
+	ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override -D $DEPLOY_ROOT/%i/machine --machine=deploy-%i /app/start.sh
 	Restart=always
 	KillMode=mixed
 
@@ -182,7 +183,8 @@ cmd_init() {
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	if [[ "$app_name" == .* ]]; then echo "❌ App name cannot start with '.'"; exit 1; fi
 	if [ -d "$app_dir" ]; then echo "❌ App $app_name already exists"; exit 1; fi
 
 	echo "📦 Creating app: $app_name"
@@ -227,16 +229,19 @@ cmd_create() {
 
 cmd_list() {
 	echo -e "📦 Deployed Apps:\n"
-	if [ ! -d "$DEPLOY_ROOT/apps" ]; then echo "  (none)"; return; fi
-
-	for app_dir in "$DEPLOY_ROOT"/apps/*; do
+	for app_dir in "$DEPLOY_ROOT"/*/; do
 		if [ ! -d "$app_dir" ]; then continue; fi
 		local app_name=$(basename "$app_dir")
 		echo "  $app_name"
 		echo "    Location: $app_dir"
-		if systemctl list-unit-files | grep -q "^deploy@.service"; then echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"; fi
-		if [ -d "$app_dir/container" ]; then echo "    Machine: deploy-$app_name.nspawn"; fi
 		if [ -f "$app_dir/current/deploy.conf" ]; then
+			local start_cmd=$(get_conf "$app_dir/current/deploy.conf" "start")
+			if [ -n "$start_cmd" ]; then
+				echo "    Type: container"
+				echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"
+			else
+				echo "    Type: static"
+			fi
 			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
 			if [ -n "$domains" ]; then echo "    Domains: $domains"; fi
 		fi
@@ -259,7 +264,7 @@ Examples:
 cmd__logs() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; shift
-	journalctl -u "deploy@$app_name" "$@"
+	journalctl --no-pager -u "deploy@$app_name" "$@"
 }
 
 cmd_restart() {
@@ -276,39 +281,38 @@ cmd__restart() {
 
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then echo "❌ App $app_name does not exist"; exit 1; fi
 	sudo "$0" _remove "$app_name"
 }
 
 cmd__remove() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	echo "🗑️  Removing app: $app_name"
 	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping service..."; systemctl stop "deploy@$app_name"; fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
-	if [ -d "/var/lib/machines/deploy-$app_name" ]; then echo "  Removing container image..."; machinectl remove "deploy-$app_name"; fi
-	if [ -f "$app_dir/caddy.conf" ]; then echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true; fi
+	if [ -f "$app_dir/caddy.conf" ]; then echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
 	echo "  Removing app files..." && rm -rf "$app_dir"
 	echo "✅ Removed $app_name"
 }
 
 cmd_shell() {
 	require_arg "$1" "Usage: deploy shell <app-name>"
-	if [ ! -d "/var/lib/machines/deploy-$1" ]; then echo "❌ Container for $1 does not exist"; exit 1; fi
+	if [ ! -d "$DEPLOY_ROOT/$1/machine" ]; then echo "❌ Container for $1 does not exist"; exit 1; fi
 	sudo "$0" _shell "$1"
 }
 
 cmd__shell() {
 	require_arg "$1" "Internal error: app name required"
 	echo "🐚 Entering container for $1..."
-	systemd-nspawn --machine="deploy-$1"
+	systemd-nspawn -D "$DEPLOY_ROOT/$1/machine" --machine="deploy-$1"
 }
 
 cmd__deploy-app() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
@@ -325,11 +329,11 @@ cmd__deploy-app() {
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local build_cmd=$(get_conf "$deployfile" "build")
 
-	if [ -n "$start_cmd" ] && [ ! -d "/var/lib/machines/deploy-$app_name" ]; then
+	if [ -n "$start_cmd" ] && [ ! -d "$app_dir/machine" ]; then
 		echo "🏗️  First deploy detected - cloning base image..."
-		machinectl clone deploy-base "deploy-$app_name"
-		rm -f "/var/lib/machines/deploy-$app_name/etc/machine-id"
-		systemd-machine-id-setup --root="/var/lib/machines/deploy-$app_name"
+		cp -a "$DEPLOY_ROOT/.internal/machine" "$app_dir/machine"
+		rm -f "$app_dir/machine/etc/machine-id"
+		systemd-machine-id-setup --root="$app_dir/machine"
 		echo "✅ Container created"
 	fi
 
@@ -341,13 +345,21 @@ cmd__deploy-app() {
 
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running build..."
-		systemd-nspawn --machine="deploy-$app_name" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		local build_dir="$app_dir/machine-build"
+		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
+		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
+		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		echo "🔄 Swapping container..."
+		systemctl stop "deploy@$app_name" 2>/dev/null || true
+		rm -rf "$app_dir/machine"
+		mv "$build_dir" "$app_dir/machine"
 	elif [ -z "$start_cmd" ] && [ -n "$build_cmd" ]; then
 		echo "🔧 Running static site build in ephemeral container..."
-		local build_machine="deploy-${app_name}-build"
-		machinectl clone deploy-base "$build_machine"
-		systemd-nspawn --machine="$build_machine" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-		machinectl remove "$build_machine"
+		local build_dir="$app_dir/machine-build"
+		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
+		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
+		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		rm -rf "$build_dir"
 		echo "✅ Build complete"
 	fi
 
@@ -358,7 +370,7 @@ cmd__deploy-app() {
 
 cmd__sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/apps/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
@@ -409,12 +421,24 @@ cmd__sync() {
 				    }
 
 				    handle {
-				        reverse_proxy http://deploy-$app_name.nspawn:$port
+				        reverse_proxy http://deploy-$app_name.nspawn:$port {
+				            transport http {
+				                resolvers 127.0.0.53
+				            }
+				        }
 				    }
 				}
 				CADDY
 			else
-				echo "$domain { reverse_proxy http://deploy-$app_name.nspawn:$port }" >> "$app_dir/caddy.conf"
+				cat >> "$app_dir/caddy.conf" <<-CADDY
+				$domain {
+				    reverse_proxy http://deploy-$app_name.nspawn:$port {
+				        transport http {
+				            resolvers 127.0.0.53
+				        }
+				    }
+				}
+				CADDY
 			fi
 		fi
 	done
@@ -425,7 +449,7 @@ cmd__sync() {
 	if ! $is_static; then
 		echo "  📝 Generating .nspawn config..."
 		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
-		printf '[Exec]\nBoot=no\n' > "$nspawn_file"
+		printf '[Exec]\nBoot=no\nParameters=/app/start.sh\n' > "$nspawn_file"
 
 		local env_count=0
 		while IFS= read -r env_var; do
@@ -464,13 +488,16 @@ cmd__sync() {
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
 		export PORT=$port
+		ip link set host0 up
+	  udhcpc -i host0 -q -f 2>/dev/null || true
+		cd /app
 		exec $start_cmd
 		STARTSH
 		chmod +x "$app_dir/start.sh"
 	fi
 
 	echo "  🔄 Reloading services..."
-	[ ${#domains[@]} -gt 0 ] && caddy reload --config "$DEPLOY_ROOT/caddy/Caddyfile" 2>/dev/null || true
+	[ ${#domains[@]} -gt 0 ] && caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	if ! $is_static; then
 		systemctl daemon-reload
 		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
@@ -487,16 +514,13 @@ cmd_uninstall() {
 
 	echo "🗑️  Uninstalling deploy.sh..."
 
-	for app_dir in "$DEPLOY_ROOT"/apps/*/; do
+	for app_dir in "$DEPLOY_ROOT"/*/; do
 		if [ ! -d "$app_dir" ]; then continue; fi
 		local app_name=$(basename "$app_dir")
 		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
 		if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
-		if [ -d "/var/lib/machines/deploy-$app_name" ]; then rm -rf "/var/lib/machines/deploy-$app_name"; fi
 	done
 	rm -f /etc/systemd/nspawn/deploy-*.nspawn
-
-	if [ -d /var/lib/machines/deploy-base ]; then rm -rf /var/lib/machines/deploy-base; fi
 
 	if systemctl is-active --quiet caddy 2>/dev/null; then echo "  Stopping caddy..."; systemctl stop caddy; fi
 	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
