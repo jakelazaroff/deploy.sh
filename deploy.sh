@@ -49,6 +49,19 @@ get_conf_all() {
 	if [ -f "$file" ]; then grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-; fi
 }
 
+assign_port() {
+	local app_name=$1 deployfile=$2
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+	local conf_port; conf_port=$(get_conf "$deployfile" "port")
+	if [ -n "$conf_port" ]; then echo "$conf_port"; return; fi
+	local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
+	if [ -n "$existing" ]; then echo "$existing"; return; fi
+	local port=8000
+	while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
+	echo "$app_name=$port" >> "$ports_file"
+	echo "$port"
+}
+
 validate_deployconf() {
 	local file=$1 app_name=$2
 	if [ ! -f "$file" ]; then echo "❌ No deploy.conf found"; exit 1; fi
@@ -295,6 +308,8 @@ cmd__remove() {
 	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
 	if [ -f "$app_dir/caddy.conf" ]; then echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
 	echo "  Removing app files..." && rm -rf "$app_dir"
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
 	echo "✅ Removed $app_name"
 }
 
@@ -375,7 +390,7 @@ cmd__sync() {
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
 	validate_deployconf "$deployfile" "$app_name"
-	local port=$(get_conf "$deployfile" "port" "7890")
+	local port; port=$(assign_port "$app_name" "$deployfile")
 
 	echo "🔄 Syncing configuration for $app_name..."
 	echo "  📝 Generating Caddy config..."
@@ -421,22 +436,14 @@ cmd__sync() {
 				    }
 
 				    handle {
-				        reverse_proxy http://deploy-$app_name.nspawn:$port {
-				            transport http {
-				                resolvers 127.0.0.53
-				            }
-				        }
+				        reverse_proxy localhost:$port
 				    }
 				}
 				CADDY
 			else
 				cat >> "$app_dir/caddy.conf" <<-CADDY
 				$domain {
-				    reverse_proxy http://deploy-$app_name.nspawn:$port {
-				        transport http {
-				            resolvers 127.0.0.53
-				        }
-				    }
+				    reverse_proxy localhost:$port
 				}
 				CADDY
 			fi
@@ -481,15 +488,13 @@ cmd__sync() {
 			((mount_count++))
 		done < <(get_conf_all "$app_conf" "mount")
 
-		echo -e "\n[Network]\nZone=deploy" >> "$nspawn_file"
+		echo -e "\n[Network]\nPrivate=no" >> "$nspawn_file"
 		if [ "$mount_count" -gt 0 ]; then echo "    Added $mount_count custom mount(s)"; fi
 		if [ "$env_count" -gt 0 ]; then echo "    Added $env_count environment variable(s)"; fi
 
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
 		export PORT=$port
-		ip link set host0 up
-	  udhcpc -i host0 -q -f 2>/dev/null || true
 		cd /app
 		exec $start_cmd
 		STARTSH
