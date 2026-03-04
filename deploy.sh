@@ -50,10 +50,8 @@ get_conf_all() {
 }
 
 assign_port() {
-	local app_name=$1 deployfile=$2
+	local app_name=$1
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	local conf_port; conf_port=$(get_conf "$deployfile" "port")
-	if [ -n "$conf_port" ]; then echo "$conf_port"; return; fi
 	local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
 	if [ -n "$existing" ]; then echo "$existing"; return; fi
 	local port=8000
@@ -114,13 +112,6 @@ cmd_init() {
 	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
-	if ! grep -q "mymachines" /etc/nsswitch.conf 2>/dev/null; then
-		echo "🔧 Configuring container hostname resolution..."
-		cp /etc/nsswitch.conf /etc/nsswitch.conf.backup
-		sed -i 's/^hosts:.*/hosts: mymachines resolve [!UNAVAIL=return] files myhostname dns/' /etc/nsswitch.conf
-		echo "✅ Configured /etc/nsswitch.conf for container resolution"
-	fi
-	systemctl enable systemd-machined 2>/dev/null || true
 
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
 		echo "📦 Pulling Alpine base image..."
@@ -219,7 +210,6 @@ cmd_create() {
 	  For a container app:
 	    start=npm start
 	    build=npm ci && npm run build
-	    port=3000
 	    domain=yourdomain.com
 	    assets=public
 
@@ -243,7 +233,9 @@ cmd_create() {
 cmd_list() {
 	echo -e "📦 Deployed Apps:\n"
 	for app_dir in "$DEPLOY_ROOT"/*/; do
+		# skip non-directories
 		if [ ! -d "$app_dir" ]; then continue; fi
+
 		local app_name=$(basename "$app_dir")
 		echo "  $app_name"
 		echo "    Location: $app_dir"
@@ -390,7 +382,7 @@ cmd__sync() {
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
 	validate_deployconf "$deployfile" "$app_name"
-	local port; port=$(assign_port "$app_name" "$deployfile")
+	local port; port=$(assign_port "$app_name")
 
 	echo "🔄 Syncing configuration for $app_name..."
 	echo "  📝 Generating Caddy config..."

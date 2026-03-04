@@ -53,9 +53,6 @@ start=npm start
 # optional: runs before each deploy
 build=npm ci && npm run build
 
-# optional: container port (default: 7890)
-port=3000
-
 # optional: serve assets before proxying
 assets=public
 
@@ -69,7 +66,7 @@ domain=example.com
 domain=www.example.com
 ```
 
-The `start` command receives `PORT` as an environment variable. Containers are accessible at `deploy-<app-name>.nspawn:<port>`.
+The `start` command receives the port to bind to as the `PORT` environment variable.
 
 Changes to deploy.conf take effect on next `git push`.
 
