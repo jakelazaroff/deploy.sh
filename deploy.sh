@@ -26,6 +26,7 @@ require_arg() {
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
+	local deployfile
 	for deployfile in "$DEPLOY_ROOT"/*/current/deploy.conf; do
 		if [ ! -f "$deployfile" ]; then continue; fi
 		local app_name=$(basename "$(dirname "$(dirname "$deployfile")")")
@@ -233,25 +234,23 @@ cmd_create() {
 cmd_list() {
 	echo -e "📦 Deployed Apps:\n"
 	for app_dir in "$DEPLOY_ROOT"/*/; do
-		# skip non-directories
 		if [ ! -d "$app_dir" ]; then continue; fi
 
 		local app_name=$(basename "$app_dir")
-		echo "  $app_name"
-		echo "    Location: $app_dir"
 		if [ -f "$app_dir/current/deploy.conf" ]; then
 			local start_cmd=$(get_conf "$app_dir/current/deploy.conf" "start")
 			if [ -n "$start_cmd" ]; then
-				echo "    Type: container"
-				echo "    Status: $(systemctl is-active "deploy@$app_name" 2>/dev/null || true)"
+				local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+				local dot="\e[31m●\e[0m"; if [ "$status" = "active" ]; then dot="\e[32m●\e[0m"; fi
+				echo -e "$dot $app_name"
 			else
-				echo "    Type: static"
+				echo -e "\e[34m●\e[0m $app_name"
 			fi
-			local domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | tr '\n' ' ')
-			if [ -n "$domains" ]; then echo "    Domains: $domains"; fi
+			local domains; domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | paste -sd ', ')
+			if [ -n "$domains" ]; then echo "└─ $domains"; fi
+		else
+			echo "● $app_name"
 		fi
-		local mount_count=$(get_conf_all "$app_dir/server.conf" "mount" | wc -l)
-		if [ "$mount_count" -gt 0 ]; then echo "    Mounts: $mount_count"; fi
 		echo
 	done
 }
