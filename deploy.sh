@@ -33,11 +33,12 @@ check_domain_collision() {
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
 		while IFS= read -r existing_domain; do
-			if [ "$existing_domain" = "$domain" ]; then echo "❌ Domain $domain already used by $app_name"; exit 1; fi
+			if [ "$existing_domain" = "$domain" ]; then echo "⚠️ Domain $domain already used by $app_name"; exit 1; fi
 		done < <(get_conf_all "$deployfile" "domain")
 	done
 }
 
+# get a value matching a given key from a config file, falling back to default
 get_conf() {
 	local file=$1 key=$2 default=${3:-}
 	if [ ! -f "$file" ]; then echo "$default"; return; fi
@@ -45,6 +46,7 @@ get_conf() {
 	echo "${value:-$default}"
 }
 
+# get all values matching a given key from a config file
 get_conf_all() {
 	local file=$1 key=$2
 	if [ -f "$file" ]; then grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-; fi
@@ -55,7 +57,7 @@ assign_port() {
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
 	if [ -n "$existing" ]; then echo "$existing"; return; fi
-	local port=8000
+	local port=49152
 	while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
 	echo "$app_name=$port" >> "$ports_file"
 	echo "$port"
@@ -63,11 +65,7 @@ assign_port() {
 
 validate_deployconf() {
 	local file=$1 app_name=$2
-	if [ ! -f "$file" ]; then echo "❌ No deploy.conf found"; exit 1; fi
-
-	local start_cmd=$(get_conf "$file" "start")
-	local has_domains=$(get_conf_all "$file" "domain" | wc -l)
-	if [ -z "$start_cmd" ] && [ "$has_domains" -eq 0 ]; then echo "❌ deploy.conf must have either 'start' (for containers) or 'domain' (for static sites)"; exit 1; fi
+	if [ ! -f "$file" ]; then return 0; fi
 
 	while IFS= read -r domain; do
 		check_domain_collision "$domain" "$app_name"
@@ -77,7 +75,7 @@ validate_deployconf() {
 # SUBCOMMANDS
 
 cmd_init() {
-	if [ "$(id -u)" -ne 0 ]; then echo "❌ deploy init must be run as root"; exit 1; fi
+	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy init must be run as root"; exit 1; fi
 	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	if ! command -v systemd-nspawn &>/dev/null; then
@@ -87,7 +85,7 @@ cmd_init() {
 		elif command -v dnf &>/dev/null; then
 			dnf install -y systemd-container
 		else
-			echo "❌ systemd-nspawn not found — install systemd-container manually"; exit 1
+			echo "⚠️ systemd-nspawn not found — install systemd-container manually"; exit 1
 		fi
 	fi
 
@@ -118,7 +116,7 @@ cmd_init() {
 		echo "📦 Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
 		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
-		if [ -z "$alpine_file" ]; then echo "❌ Could not find Alpine minirootfs for $arch"; exit 1; fi
+		if [ -z "$alpine_file" ]; then echo "⚠️ Could not find Alpine minirootfs for $arch"; exit 1; fi
 		mkdir -p "$DEPLOY_ROOT/.internal/machine"
 		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
 		echo "🔧 Installing bash in base image..."
@@ -130,7 +128,7 @@ cmd_init() {
 
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
-		if [ -z "$acme_email" ]; then echo "❌ Email is required for HTTPS certificate provisioning"; exit 1; fi
+		if [ -z "$acme_email" ]; then echo "⚠️ Email is required for HTTPS certificate provisioning"; exit 1; fi
 		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
@@ -189,8 +187,8 @@ cmd_init() {
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [[ "$app_name" == .* ]]; then echo "❌ App name cannot start with '.'"; exit 1; fi
-	if [ -d "$app_dir" ]; then echo "❌ App $app_name already exists"; exit 1; fi
+	if [[ "$app_name" == .* ]]; then echo "⚠️ App name cannot start with '.'"; exit 1; fi
+	if [ -d "$app_dir" ]; then echo "⚠️ App $app_name already exists"; exit 1; fi
 
 	echo "📦 Creating app: $app_name"
 	mkdir -p "$app_dir"/{releases,repo.git}
@@ -232,26 +230,31 @@ cmd_create() {
 }
 
 cmd_list() {
-	echo -e "📦 Deployed Apps:\n"
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		if [ ! -d "$app_dir" ]; then continue; fi
 
 		local app_name=$(basename "$app_dir")
+		local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
+		local deployed_at=""
+		if [ -n "$release_name" ]; then
+			deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+		fi
+
 		if [ -f "$app_dir/current/deploy.conf" ]; then
 			local start_cmd=$(get_conf "$app_dir/current/deploy.conf" "start")
 			if [ -n "$start_cmd" ]; then
 				local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
 				local dot="\e[31m●\e[0m"; if [ "$status" = "active" ]; then dot="\e[32m●\e[0m"; fi
-				echo -e "$dot $app_name"
+				echo -e "$dot \e[1m$app_name\e[0m"
 			else
-				echo -e "\e[34m●\e[0m $app_name"
+				echo -e "\e[34m●\e[0m \e[1m$app_name\e[0m"
 			fi
+			if [ -n "$deployed_at" ]; then echo "┆ Last deployed: $deployed_at"; fi
 			local domains; domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | paste -sd ', ')
-			if [ -n "$domains" ]; then echo "└─ $domains"; fi
+			if [ -n "$domains" ]; then echo "┆ Domains: $domains"; fi
 		else
 			echo "● $app_name"
 		fi
-		echo
 	done
 }
 
@@ -266,7 +269,6 @@ Examples:
 }
 
 cmd__logs() {
-	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; shift
 	journalctl --no-pager -u "deploy@$app_name" "$@"
 }
@@ -277,7 +279,6 @@ cmd_restart() {
 }
 
 cmd__restart() {
-	require_arg "$1" "Internal error: app name required"
 	echo "🔄 Restarting $1..."
 	systemctl restart "deploy@$1"
 	echo "✅ Restarted"
@@ -286,7 +287,7 @@ cmd__restart() {
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [ ! -d "$app_dir" ]; then echo "❌ App $app_name does not exist"; exit 1; fi
+	if [ ! -d "$app_dir" ]; then echo "⚠️ App $app_name does not exist"; exit 1; fi
 	sudo "$0" _remove "$app_name"
 }
 
@@ -306,7 +307,7 @@ cmd__remove() {
 
 cmd_shell() {
 	require_arg "$1" "Usage: deploy shell <app-name>"
-	if [ ! -d "$DEPLOY_ROOT/$1/machine" ]; then echo "❌ Container for $1 does not exist"; exit 1; fi
+	if [ ! -d "$DEPLOY_ROOT/$1/machine" ]; then echo "⚠️ Container for $1 does not exist"; exit 1; fi
 	sudo "$0" _shell "$1"
 }
 
@@ -503,7 +504,7 @@ cmd__sync() {
 }
 
 cmd_uninstall() {
-	if [ "$(id -u)" -ne 0 ]; then echo "❌ deploy uninstall must be run as root"; exit 1; fi
+	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy uninstall must be run as root"; exit 1; fi
 	echo "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
 	read -rp "Type 'yes' to confirm: " confirm
 	if [ "$confirm" != "yes" ]; then echo "Aborted."; exit 1; fi
@@ -539,7 +540,7 @@ cmd_uninstall() {
 
 cmd_help() {
 	cat <<-HELP
-	🚀 deploy.sh
+	📦 deploy.sh
 
 	Usage:
 	  deploy init                        Initialize the deployment system
