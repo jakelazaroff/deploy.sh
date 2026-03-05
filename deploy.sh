@@ -23,6 +23,8 @@ require_arg() {
 	if [ -z "$arg" ]; then echo "$usage"; exit 1; fi
 }
 
+require_root() { if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi; }
+
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
@@ -283,10 +285,7 @@ Examples:
   deploy logs myapi
   deploy logs myapi -f
   deploy logs myapi --since '1 hour ago'"
-	sudo "$0" _logs "$@"
-}
-
-cmd__logs() {
+	require_root logs "$@"
 	local app_name=$1; shift
 	journalctl --no-pager -u "deploy@$app_name" "$@"
 }
@@ -304,10 +303,7 @@ Examples:
   deploy requests myapp -f
   deploy requests myapp --since '1 hour ago'
   deploy requests myapp --since '2026-03-01 10:00' --before '2026-03-01 11:00'"
-	sudo "$0" _requests "$@"
-}
-
-cmd__requests() {
+	require_root requests "$@"
 	local app_name=$1; shift
 	local log_file="$DEPLOY_ROOT/.internal/access.log"
 	local deployfile="$DEPLOY_ROOT/$app_name/current/deploy.conf"
@@ -346,10 +342,7 @@ cmd__requests() {
 
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
-	sudo "$0" _restart "$1"
-}
-
-cmd__restart() {
+	require_root restart "$@"
 	echo "🔄 Restarting $1..."
 	systemctl restart "deploy@$1"
 	echo "✅ Restarted"
@@ -359,12 +352,7 @@ cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then echo "⚠️ App $app_name does not exist"; exit 1; fi
-	sudo "$0" _remove "$app_name"
-}
-
-cmd__remove() {
-	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	require_root remove "$@"
 	echo "🗑️  Removing app: $app_name"
 	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping service..."; systemctl stop "deploy@$app_name"; fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
@@ -379,11 +367,7 @@ cmd__remove() {
 cmd_shell() {
 	require_arg "$1" "Usage: deploy shell <app-name>"
 	if [ ! -d "$DEPLOY_ROOT/$1/machine" ]; then echo "⚠️ Container for $1 does not exist"; exit 1; fi
-	sudo "$0" _shell "$1"
-}
-
-cmd__shell() {
-	require_arg "$1" "Internal error: app name required"
+	require_root shell "$@"
 	echo "🐚 Entering container for $1..."
 	local leader
 	leader=$(machinectl show "deploy-$1" -p Leader --value 2>/dev/null)
@@ -670,11 +654,6 @@ case "${1:-help}" in
 	uninstall)       cmd_uninstall ;;
 	_deploy-app)     shift; cmd__deploy-app "$@" ;;
 	_sync)           shift; cmd__sync "$@" ;;
-	_logs)           shift; cmd__logs "$@" ;;
-	_requests)       shift; cmd__requests "$@" ;;
-	_restart)        shift; cmd__restart "$@" ;;
-	_remove)         shift; cmd__remove "$@" ;;
-	_shell)          shift; cmd__shell "$@" ;;
 	help|--help|-h)  cmd_help ;;
 	*)               echo "Unknown command: $1"; echo "Run \"deploy help\" for usage"; exit 1 ;;
 esac
