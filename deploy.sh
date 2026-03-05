@@ -255,21 +255,16 @@ cmd_create() {
 }
 
 cmd_list() {
+	local names=()
+	for app_dir in "$DEPLOY_ROOT"/*/; do
+		[ -d "$app_dir" ] && names+=("$(basename "$app_dir")")
+	done
 	if $FMT_JSON; then
-		local first=true
-		printf '['
-		for app_dir in "$DEPLOY_ROOT"/*/; do
-			if [ ! -d "$app_dir" ]; then continue; fi
-			$first || printf ','
-			printf '%s' "$(json_str "$(basename "$app_dir")")"
-			first=false
-		done
-		printf ']\n'
+		local out='[' sep=''
+		for name in "${names[@]}"; do out+="$sep$(json_str "$name")"; sep=','; done
+		printf '%s]\n' "$out"
 	else
-		for app_dir in "$DEPLOY_ROOT"/*/; do
-			if [ ! -d "$app_dir" ]; then continue; fi
-			echo $(basename "$app_dir")
-		done
+		printf '%s\n' "${names[@]}"
 	fi
 }
 
@@ -281,49 +276,7 @@ cmd_info() {
 	local deployfile="$app_dir/current/deploy.conf"
 	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
 
-	if $FMT_JSON; then
-		local type="null" status="null" command="null" last_deployed="null"
-		local domains_json="null" assets_json="null" spa_json="false"
-
-		if [ -n "$release_name" ]; then
-			local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-			last_deployed=$(json_str "$deployed_at")
-		fi
-
-		if [ -f "$deployfile" ]; then
-			local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
-			if [ -n "$start_cmd" ]; then
-				local svc_status; svc_status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
-				type=$(json_str "container")
-				status=$(json_str "$svc_status")
-				command=$(json_str "$start_cmd")
-			else
-				type=$(json_str "static")
-			fi
-
-			local domains=()
-			while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
-			if [ ${#domains[@]} -gt 0 ]; then
-				domains_json="["
-				local first=true
-				for d in "${domains[@]}"; do
-					$first || domains_json+=","
-					domains_json+=$(json_str "$d")
-					first=false
-				done
-				domains_json+="]"
-			fi
-
-			local assets; assets=$(get_conf "$deployfile" "assets")
-			if [ -n "$assets" ]; then assets_json=$(json_str "$assets"); fi
-
-			local spa; spa=$(get_conf "$deployfile" "spa")
-			if [ "$spa" = "true" ]; then spa_json="true"; fi
-		fi
-
-		printf '{"name":%s,"type":%s,"status":%s,"command":%s,"last_deployed":%s,"domains":%s,"assets":%s,"spa":%s}\n' \
-			"$(json_str "$app_name")" "$type" "$status" "$command" "$last_deployed" "$domains_json" "$assets_json" "$spa_json"
-	else
+	if ! $FMT_JSON; then
 		echo -e "\e[1m$app_name\e[0m"
 
 		if [ -n "$release_name" ]; then
@@ -354,7 +307,45 @@ cmd_info() {
 
 		local spa; spa=$(get_conf "$deployfile" "spa")
 		if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
+		return
 	fi
+
+	local type="null" status="null" command="null" last_deployed="null"
+	local domains_json="null" assets_json="null" spa_json="false"
+
+	if [ -n "$release_name" ]; then
+		local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+		last_deployed=$(json_str "$deployed_at")
+	fi
+
+	if [ -f "$deployfile" ]; then
+		local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
+		if [ -n "$start_cmd" ]; then
+			local svc_status; svc_status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+			type=$(json_str "container")
+			status=$(json_str "$svc_status")
+			command=$(json_str "$start_cmd")
+		else
+			type=$(json_str "static")
+		fi
+
+		local domains=()
+		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
+		if [ ${#domains[@]} -gt 0 ]; then
+			local out='[' sep=''
+			for d in "${domains[@]}"; do out+="$sep$(json_str "$d")"; sep=','; done
+			domains_json="$out]"
+		fi
+
+		local assets; assets=$(get_conf "$deployfile" "assets")
+		if [ -n "$assets" ]; then assets_json=$(json_str "$assets"); fi
+
+		local spa; spa=$(get_conf "$deployfile" "spa")
+		if [ "$spa" = "true" ]; then spa_json="true"; fi
+	fi
+
+	printf '{"name":%s,"type":%s,"status":%s,"command":%s,"last_deployed":%s,"domains":%s,"assets":%s,"spa":%s}\n' \
+		"$(json_str "$app_name")" "$type" "$status" "$command" "$last_deployed" "$domains_json" "$assets_json" "$spa_json"
 }
 
 cmd_logs() {
@@ -430,7 +421,7 @@ cmd_restart() {
 	if systemctl restart "deploy@$1"; then
 		ok "✅ Restarted"
 	else
-		$FMT_JSON && printf '{"ok":false,"error":%s}\n' "$(json_str "Failed to restart $1")" || exit 1
+		die "Failed to restart $1"
 	fi
 }
 
