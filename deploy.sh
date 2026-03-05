@@ -219,7 +219,7 @@ cmd_create() {
 	    spa=true
 
 	Next steps:
-	  git remote add deploy $DEPLOY_USER@\$(hostname):$app_dir/repo.git
+	  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git
 	  git push deploy main
 
 	To configure mounts or environment variables, create $app_dir/server.conf on the server:
@@ -232,30 +232,48 @@ cmd_create() {
 cmd_list() {
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		if [ ! -d "$app_dir" ]; then continue; fi
-
-		local app_name=$(basename "$app_dir")
-		local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
-		local deployed_at=""
-		if [ -n "$release_name" ]; then
-			deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-		fi
-
-		if [ -f "$app_dir/current/deploy.conf" ]; then
-			local start_cmd=$(get_conf "$app_dir/current/deploy.conf" "start")
-			if [ -n "$start_cmd" ]; then
-				local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
-				local dot="\e[31m●\e[0m"; if [ "$status" = "active" ]; then dot="\e[32m●\e[0m"; fi
-				echo -e "$dot \e[1m$app_name\e[0m"
-			else
-				echo -e "\e[34m●\e[0m \e[1m$app_name\e[0m"
-			fi
-			if [ -n "$deployed_at" ]; then echo "┆ Last deployed: $deployed_at"; fi
-			local domains; domains=$(get_conf_all "$app_dir/current/deploy.conf" "domain" | paste -sd ', ')
-			if [ -n "$domains" ]; then echo "┆ Domains: $domains"; fi
-		else
-			echo "● $app_name"
-		fi
+		echo $(basename "$app_dir")
 	done
+}
+
+cmd_info() {
+	require_arg "$1" "Usage: deploy info <app-name>"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/$1"
+	if [ ! -d "$app_dir" ]; then echo "⚠️ App $app_name does not exist"; exit 1; fi
+
+	local deployfile="$app_dir/current/deploy.conf"
+	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
+
+	echo -e "\e[1m$app_name\e[0m"
+
+	if [ -n "$release_name" ]; then
+		local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+		echo "┆ Last deployed: $deployed_at"
+	fi
+
+	if [ ! -f "$deployfile" ]; then echo "┆ Not yet deployed"; return; fi
+
+	local start_cmd=$(get_conf "$deployfile" "start")
+	if [ -n "$start_cmd" ]; then
+		local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+		echo "┆ Type:    container ($status)"
+		echo "┆ Command: $start_cmd"
+	else
+		echo "┆ Type:    static"
+	fi
+
+	local domains=()
+	while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
+	if [ ${#domains[@]} -gt 0 ]; then
+		echo "┆ Domains:"
+		for d in "${domains[@]}"; do echo "┆   $d"; done
+	fi
+
+	local assets=$(get_conf "$deployfile" "assets")
+	if [ -n "$assets" ]; then echo "┆ Assets:  $assets"; fi
+
+	local spa=$(get_conf "$deployfile" "spa")
+	if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
 }
 
 cmd_logs() {
@@ -271,6 +289,59 @@ Examples:
 cmd__logs() {
 	local app_name=$1; shift
 	journalctl --no-pager -u "deploy@$app_name" "$@"
+}
+
+cmd_requests() {
+	require_arg "$1" "Usage: deploy requests <app-name> [options...]
+
+Options:
+  -f                  Follow log output
+  --since <date>      Show requests since date
+  --before <date>     Show requests before date
+
+Examples:
+  deploy requests myapp
+  deploy requests myapp -f
+  deploy requests myapp --since '1 hour ago'
+  deploy requests myapp --since '2026-03-01 10:00' --before '2026-03-01 11:00'"
+	sudo "$0" _requests "$@"
+}
+
+cmd__requests() {
+	local app_name=$1; shift
+	local log_file="$DEPLOY_ROOT/.internal/access.log"
+	local deployfile="$DEPLOY_ROOT/$app_name/current/deploy.conf"
+	local follow=false since_ts="" before_ts=""
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-f) follow=true ;;
+			--since) shift; since_ts=$(date -d "$1" +%s 2>/dev/null) || { echo "⚠️ Invalid --since date: $1"; exit 1; } ;;
+			--before) shift; before_ts=$(date -d "$1" +%s 2>/dev/null) || { echo "⚠️ Invalid --before date: $1"; exit 1; } ;;
+		esac
+		shift
+	done
+
+	if [ ! -f "$log_file" ]; then echo "No access log found at $log_file"; exit 1; fi
+
+	local domains=()
+	while IFS= read -r domain; do domains+=("$domain"); done < <(get_conf_all "$deployfile" "domain")
+	if [ ${#domains[@]} -eq 0 ]; then echo "No domains configured for $app_name"; exit 1; fi
+
+	local pattern; pattern=$(printf '%s\n' "${domains[@]}" | paste -sd '|')
+
+	if $follow; then tail -f "$log_file"; else cat "$log_file"; fi \
+	| awk -v p="$pattern" -v since="$since_ts" -v before="$before_ts" '
+		$0 ~ p {
+			if (since != "" || before != "") {
+				if (match($0, /"ts":[0-9]+/))
+					ts = substr($0, RSTART+5, RLENGTH-5) + 0
+				if (since  != "" && ts < since+0)  next
+				if (before != "" && ts > before+0) next
+			}
+			print
+		}
+	'
 }
 
 cmd_restart() {
@@ -314,7 +385,14 @@ cmd_shell() {
 cmd__shell() {
 	require_arg "$1" "Internal error: app name required"
 	echo "🐚 Entering container for $1..."
-	systemd-nspawn -D "$DEPLOY_ROOT/$1/machine" --machine="deploy-$1"
+	local leader
+	leader=$(machinectl show "deploy-$1" -p Leader --value 2>/dev/null)
+	if [ -n "$leader" ] && [ "$leader" -gt 0 ] 2>/dev/null; then
+		nsenter -t "$leader" -m -u -i -p --root --wd=/ -- /bin/bash 2>/dev/null || \
+		nsenter -t "$leader" -m -u -i -p --root --wd=/ -- /bin/sh
+	else
+		systemd-nspawn -D "$DEPLOY_ROOT/$1/machine" --machine="deploy-$1"
+	fi
 }
 
 cmd__deploy-app() {
@@ -404,6 +482,9 @@ cmd__sync() {
 				    try_files {path} /index.html
 				    file_server
 				    encode gzip
+				    log {
+				        output file $DEPLOY_ROOT/.internal/access.log
+				    }
 				}
 				CADDY
 			else
@@ -412,6 +493,9 @@ cmd__sync() {
 				    root * $root_path
 				    file_server
 				    encode gzip
+				    log {
+				        output file $DEPLOY_ROOT/.internal/access.log
+				    }
 				}
 				CADDY
 			fi
@@ -430,12 +514,19 @@ cmd__sync() {
 				    handle {
 				        reverse_proxy localhost:$port
 				    }
+
+				    log {
+				        output file $DEPLOY_ROOT/.internal/access.log
+				    }
 				}
 				CADDY
 			else
 				cat >> "$app_dir/caddy.conf" <<-CADDY
 				$domain {
 				    reverse_proxy localhost:$port
+				    log {
+				        output file $DEPLOY_ROOT/.internal/access.log
+				    }
 				}
 				CADDY
 			fi
@@ -453,7 +544,7 @@ cmd__sync() {
 		local env_count=0
 		while IFS= read -r env_var; do
 			echo "Environment=\"$env_var\"" >> "$nspawn_file"
-			((env_count++))
+			((++env_count))
 		done < <(get_conf_all "$app_conf" "env")
 
 		cat >> "$nspawn_file" <<-NSPAWN
@@ -477,7 +568,7 @@ cmd__sync() {
 			fi
 			if [ ! -e "$host_path" ]; then echo "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; fi
 			echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
-			((mount_count++))
+			((++mount_count))
 		done < <(get_conf_all "$app_conf" "mount")
 
 		echo -e "\n[Network]\nPrivate=no" >> "$nspawn_file"
@@ -543,15 +634,17 @@ cmd_help() {
 	📦 deploy.sh
 
 	Usage:
-	  deploy init                        Initialize the deployment system
-	  deploy create <name>               Create a new app
-	  deploy list                        List all apps
-	  deploy logs <name> [options...]    Show app logs
-	  deploy shell <name>                Shell into container
-	  deploy restart <name>              Restart an app
-	  deploy remove <name>               Remove an app
-	  deploy uninstall                   Remove all deploy.sh system changes
-	  deploy help                        Show this help
+	  deploy init                         Initialize the deployment system
+	  deploy create <name>                Create a new app
+	  deploy list                         List all apps
+	  deploy info <name>                  Show app info
+	  deploy logs <name> [options...]     Show app logs
+	  deploy requests <name> [options...] Show app requests
+	  deploy shell <name>                 Shell into container
+	  deploy restart <name>               Restart an app
+	  deploy remove <name>                Remove an app
+	  deploy uninstall                    Remove all deploy.sh system changes
+	  deploy help                         Show this help
 	HELP
 }
 
@@ -568,7 +661,9 @@ case "${1:-help}" in
 	init)            cmd_init ;;
 	create)          shift; cmd_create "$@" ;;
 	list)            cmd_list ;;
+	info)            shift; cmd_info "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
+	requests)        shift; cmd_requests "$@" ;;
 	shell)           shift; cmd_shell "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
@@ -576,6 +671,7 @@ case "${1:-help}" in
 	_deploy-app)     shift; cmd__deploy-app "$@" ;;
 	_sync)           shift; cmd__sync "$@" ;;
 	_logs)           shift; cmd__logs "$@" ;;
+	_requests)       shift; cmd__requests "$@" ;;
 	_restart)        shift; cmd__restart "$@" ;;
 	_remove)         shift; cmd__remove "$@" ;;
 	_shell)          shift; cmd__shell "$@" ;;
