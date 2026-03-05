@@ -27,9 +27,15 @@ json_str() {
 # Print an error and exit (JSON-aware)
 die() {
 	if $FMT_JSON; then printf '{"ok":false,"error":%s}\n' "$(json_str "$1")"
-	else echo "⚠️ $1"; fi
+	else echo "⚠️ $1" >&2; fi
 	exit 1
 }
+
+# Print a progress message to stderr; no-op in JSON mode
+log() { $FMT_JSON || echo "$@" >&2; }
+
+# Print a success result; emits {"ok":true} in JSON mode
+ok() { $FMT_JSON && printf '{"ok":true}\n' || log "$1"; }
 
 # Require an argument or exit with usage message
 require_arg() {
@@ -52,7 +58,7 @@ check_domain_collision() {
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
 		while IFS= read -r existing_domain; do
-			if [ "$existing_domain" = "$domain" ]; then echo "⚠️ Domain $domain already used by $app_name"; exit 1; fi
+			if [ "$existing_domain" = "$domain" ]; then die "Domain $domain already used by $app_name"; fi
 		done < <(get_conf_all "$deployfile" "domain")
 	done
 }
@@ -94,21 +100,21 @@ validate_deployconf() {
 # SUBCOMMANDS
 
 cmd_init() {
-	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy init must be run as root"; exit 1; fi
-	echo "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
+	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy init must be run as root" >&2; exit 1; fi
+	log "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	if ! command -v systemd-nspawn &>/dev/null; then
-		echo "📦 Installing systemd-container..."
+		log "📦 Installing systemd-container..."
 		if command -v apt-get &>/dev/null; then
 			apt-get install -y systemd-container
 		elif command -v dnf &>/dev/null; then
 			dnf install -y systemd-container
 		else
-			echo "⚠️ systemd-nspawn not found — install systemd-container manually"; exit 1
+			die "systemd-nspawn not found — install systemd-container manually"
 		fi
 	fi
 
-	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; echo "✅ Created user: $DEPLOY_USER"; }
+	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; log "✅ Created user: $DEPLOY_USER"; }
 
 	local src_keys=""
 	if [ -n "$SUDO_USER" ]; then
@@ -122,9 +128,9 @@ cmd_init() {
 		cp "$src_keys" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 		chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
 		chmod 700 "/home/$DEPLOY_USER/.ssh" && chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
-		echo "✅ Copied SSH authorized_keys from $src_keys"
+		log "✅ Copied SSH authorized_keys from $src_keys"
 	else
-		echo "⚠️  No authorized_keys found — add your public key manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
+		log "⚠️  No authorized_keys found — add your public key manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
 	fi
 
 	mkdir -p "$DEPLOY_ROOT/.internal"
@@ -132,22 +138,22 @@ cmd_init() {
 
 
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
-		echo "📦 Pulling Alpine base image..."
+		log "📦 Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
 		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
-		if [ -z "$alpine_file" ]; then echo "⚠️ Could not find Alpine minirootfs for $arch"; exit 1; fi
+		if [ -z "$alpine_file" ]; then die "Could not find Alpine minirootfs for $arch"; fi
 		mkdir -p "$DEPLOY_ROOT/.internal/machine"
 		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
-		echo "🔧 Installing bash in base image..."
+		log "🔧 Installing bash in base image..."
 		systemd-nspawn -D "$DEPLOY_ROOT/.internal/machine" /bin/sh -c "apk update && apk add --no-cache bash"
-		echo "✅ Base image ready"
+		log "✅ Base image ready"
 	fi
 
-	command -v caddy &>/dev/null || { echo "📦 Installing Caddy..."; curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy; chmod +x /usr/local/bin/caddy; }
+	command -v caddy &>/dev/null || { log "📦 Installing Caddy..."; curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy; chmod +x /usr/local/bin/caddy; }
 
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
-		if [ -z "$acme_email" ]; then echo "⚠️ Email is required for HTTPS certificate provisioning"; exit 1; fi
+		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
 		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
@@ -155,7 +161,7 @@ cmd_init() {
 
 		import $DEPLOY_ROOT/*/caddy.conf
 		CADDY
-		echo "📝 Created Caddyfile"
+		log "📝 Created Caddyfile"
 	fi
 
 	cat > /etc/systemd/system/caddy.service <<-SERVICE
@@ -191,25 +197,25 @@ cmd_init() {
 	[Install]
 	WantedBy=multi-user.target
 	SERVICE
-	echo "📝 Created deploy@.service template"
+	log "📝 Created deploy@.service template"
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
 	ALL ALL=(deploy) NOPASSWD: /usr/local/bin/deploy *
 	SUDOERS
 	chmod 0440 /etc/sudoers.d/deploy
-	echo "📝 Created /etc/sudoers.d/deploy"
+	log "📝 Created /etc/sudoers.d/deploy"
 
-	echo -e "\n✅ System initialized!\n   Location: $DEPLOY_ROOT\n\nNext: deploy create <app-name>"
+	log -e "\n✅ System initialized!\n   Location: $DEPLOY_ROOT\n\nNext: deploy create <app-name>"
 }
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [[ "$app_name" == .* ]]; then echo "⚠️ App name cannot start with '.'"; exit 1; fi
-	if [ -d "$app_dir" ]; then echo "⚠️ App $app_name already exists"; exit 1; fi
+	if [[ "$app_name" == .* ]]; then echo "⚠️ App name cannot start with '.'" >&2; exit 1; fi
+	if [ -d "$app_dir" ]; then echo "⚠️ App $app_name already exists" >&2; exit 1; fi
 
-	echo "📦 Creating app: $app_name"
+	log "📦 Creating app: $app_name"
 	mkdir -p "$app_dir"/{releases,repo.git}
 	cd "$app_dir/repo.git" && git init --bare --initial-branch=main
 
@@ -220,7 +226,7 @@ cmd_create() {
 	chmod +x hooks/post-receive
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 
-	cat <<-MSG
+	cat >&2 <<-MSG
 	✅ Created app: $app_name
 
 	Add a deploy.conf to your repo root:
@@ -389,17 +395,17 @@ Examples:
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-f) follow=true ;;
-			--since) shift; since_ts=$(date -d "$1" +%s 2>/dev/null) || { echo "⚠️ Invalid --since date: $1"; exit 1; } ;;
-			--before) shift; before_ts=$(date -d "$1" +%s 2>/dev/null) || { echo "⚠️ Invalid --before date: $1"; exit 1; } ;;
+			--since) shift; since_ts=$(date -d "$1" +%s 2>/dev/null) || die "Invalid --since date: $1" ;;
+			--before) shift; before_ts=$(date -d "$1" +%s 2>/dev/null) || die "Invalid --before date: $1" ;;
 		esac
 		shift
 	done
 
-	if [ ! -f "$log_file" ]; then echo "No access log found at $log_file"; exit 1; fi
+	if [ ! -f "$log_file" ]; then die "No access log found at $log_file"; fi
 
 	local domains=()
 	while IFS= read -r domain; do domains+=("$domain"); done < <(get_conf_all "$deployfile" "domain")
-	if [ ${#domains[@]} -eq 0 ]; then echo "No domains configured for $app_name"; exit 1; fi
+	if [ ${#domains[@]} -eq 0 ]; then die "No domains configured for $app_name"; fi
 
 	local pattern; pattern=$(printf '%s\n' "${domains[@]}" | paste -sd '|')
 
@@ -420,12 +426,11 @@ Examples:
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
 	require_root restart "$@"
-	if $FMT_JSON; then
-		systemctl restart "deploy@$1" && printf '{"ok":true}\n' || printf '{"ok":false,"error":%s}\n' "$(json_str "Failed to restart $1")"
+	log "🔄 Restarting $1..."
+	if systemctl restart "deploy@$1"; then
+		ok "✅ Restarted"
 	else
-		echo "🔄 Restarting $1..."
-		systemctl restart "deploy@$1"
-		echo "✅ Restarted"
+		$FMT_JSON && printf '{"ok":false,"error":%s}\n' "$(json_str "Failed to restart $1")" || exit 1
 	fi
 }
 
@@ -434,23 +439,22 @@ cmd_remove() {
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
-	if ! $FMT_JSON; then echo "🗑️  Removing app: $app_name"; fi
+	log "🗑️  Removing app: $app_name"
 	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
-		if ! $FMT_JSON; then echo "  Stopping service..."; fi
+		log "  Stopping service..."
 		systemctl stop "deploy@$app_name"
 	fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
 	if [ -f "$app_dir/caddy.conf" ]; then
-		if ! $FMT_JSON; then echo "  Removing from Caddy..."; fi
+		log "  Removing from Caddy..."
 		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	fi
-	if ! $FMT_JSON; then echo "  Removing app files..."; fi
+	log "  Removing app files..."
 	rm -rf "$app_dir"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
-	if $FMT_JSON; then printf '{"ok":true}\n'
-	else echo "✅ Removed $app_name"; fi
+	ok "✅ Removed $app_name"
 }
 
 cmd__deploy-app() {
@@ -459,25 +463,25 @@ cmd__deploy-app() {
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
-	echo "📦 Deploying $app_name..."
+	log "📦 Deploying $app_name..."
 	mkdir -p "$release_dir"
 	local repo_dir=$(pwd)
 	unset GIT_DIR
 	git --work-tree="$release_dir" --git-dir="$repo_dir" checkout HEAD -f
 	cd "$release_dir"
 	ln -sfn "$release_dir" "$current_link"
-	echo "✅ Deployed to $current_link"
+	log "✅ Deployed to $current_link"
 
 	local deployfile="$release_dir/deploy.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local build_cmd=$(get_conf "$deployfile" "build")
 
 	if [ -n "$start_cmd" ] && [ ! -d "$app_dir/machine" ]; then
-		echo "🏗️  First deploy detected - cloning base image..."
+		log "🏗️  First deploy detected - cloning base image..."
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$app_dir/machine"
 		rm -f "$app_dir/machine/etc/machine-id"
 		systemd-machine-id-setup --root="$app_dir/machine"
-		echo "✅ Container created"
+		log "✅ Container created"
 	fi
 
 	local app_conf="$app_dir/server.conf"
@@ -487,28 +491,28 @@ cmd__deploy-app() {
 	done < <(get_conf_all "$app_conf" "env")
 
 	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
-		echo "🔧 Running build..."
+		log "🔧 Running build..."
 		local build_dir="$app_dir/machine-build"
 		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-		echo "🔄 Swapping container..."
+		log "🔄 Swapping container..."
 		systemctl stop "deploy@$app_name" 2>/dev/null || true
 		rm -rf "$app_dir/machine"
 		mv "$build_dir" "$app_dir/machine"
 	elif [ -z "$start_cmd" ] && [ -n "$build_cmd" ]; then
-		echo "🔧 Running static site build in ephemeral container..."
+		log "🔧 Running static site build in ephemeral container..."
 		local build_dir="$app_dir/machine-build"
 		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
 		rm -rf "$build_dir"
-		echo "✅ Build complete"
+		log "✅ Build complete"
 	fi
 
 	cmd__sync "$app_name"
 	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
-	echo "🧹 Cleaned up old releases"
+	log "🧹 Cleaned up old releases"
 }
 
 cmd__sync() {
@@ -520,8 +524,8 @@ cmd__sync() {
 	validate_deployconf "$deployfile" "$app_name"
 	local port; port=$(assign_port "$app_name")
 
-	echo "🔄 Syncing configuration for $app_name..."
-	echo "  📝 Generating Caddy config..."
+	log "🔄 Syncing configuration for $app_name..."
+	log "  📝 Generating Caddy config..."
 	> "$app_dir/caddy.conf"
 
 	local domains; domains=$(get_conf_all "$deployfile" "domain")
@@ -544,15 +548,15 @@ cmd__sync() {
 		caddyconf+="    log { output file $DEPLOY_ROOT/.internal/access.log }"
 		local host="${domains//$'\n'/, }"
 		printf '%s {\n%s\n}\n' "$host" "$caddyconf" >> "$app_dir/caddy.conf"
-		echo "    Configured domain(s): $host"
-		if [ -n "$static_dir" ]; then echo "    Assets directory: $static_dir"; fi
-		if [ "$spa_mode" = "true" ]; then echo "    SPA mode: enabled"; fi
+		log "    Configured domain(s): $host"
+		if [ -n "$static_dir" ]; then log "    Assets directory: $static_dir"; fi
+		if [ "$spa_mode" = "true" ]; then log "    SPA mode: enabled"; fi
 	else
-		echo "    No domains configured"
+		log "    No domains configured"
 	fi
 
 	if ! $is_static; then
-		echo "  📝 Generating .nspawn config..."
+		log "  📝 Generating .nspawn config..."
 		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
 		printf '[Exec]\nBoot=no\nParameters=/app/start.sh\n' > "$nspawn_file"
 
@@ -579,16 +583,16 @@ cmd__sync() {
 			elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
 				host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
 			else
-				echo "⚠️  Skipping invalid mount: $mount"; continue
+				log "⚠️  Skipping invalid mount: $mount"; continue
 			fi
-			if [ ! -e "$host_path" ]; then echo "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; fi
+			if [ ! -e "$host_path" ]; then log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; fi
 			echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
 			((++mount_count))
 		done < <(get_conf_all "$app_conf" "mount")
 
 		echo -e "\n[Network]\nPrivate=no" >> "$nspawn_file"
-		if [ "$mount_count" -gt 0 ]; then echo "    Added $mount_count custom mount(s)"; fi
-		if [ "$env_count" -gt 0 ]; then echo "    Added $env_count environment variable(s)"; fi
+		if [ "$mount_count" -gt 0 ]; then log "    Added $mount_count custom mount(s)"; fi
+		if [ "$env_count" -gt 0 ]; then log "    Added $env_count environment variable(s)"; fi
 
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
@@ -599,33 +603,33 @@ cmd__sync() {
 		chmod +x "$app_dir/start.sh"
 	fi
 
-	echo "  🔄 Reloading services..."
+	log "  🔄 Reloading services..."
 	[ ${#domains[@]} -gt 0 ] && caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	if ! $is_static; then
 		systemctl daemon-reload
 		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
 		systemctl restart "deploy@$app_name"
 	fi
-	echo "✅ Configuration synced"
+	log "✅ Configuration synced"
 }
 
 cmd_uninstall() {
-	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy uninstall must be run as root"; exit 1; fi
-	echo "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
+	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy uninstall must be run as root" >&2; exit 1; fi
+	log "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
 	read -rp "Type 'yes' to confirm: " confirm
-	if [ "$confirm" != "yes" ]; then echo "Aborted."; exit 1; fi
+	if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 
-	echo "🗑️  Uninstalling deploy.sh..."
+	log "🗑️  Uninstalling deploy.sh..."
 
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		if [ ! -d "$app_dir" ]; then continue; fi
 		local app_name=$(basename "$app_dir")
-		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
+		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then log "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
 		if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	done
 	rm -f /etc/systemd/nspawn/deploy-*.nspawn
 
-	if systemctl is-active --quiet caddy 2>/dev/null; then echo "  Stopping caddy..."; systemctl stop caddy; fi
+	if systemctl is-active --quiet caddy 2>/dev/null; then log "  Stopping caddy..."; systemctl stop caddy; fi
 	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
 	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
 
@@ -635,13 +639,13 @@ cmd_uninstall() {
 
 	if [ -f /etc/nsswitch.conf.backup ]; then
 		mv /etc/nsswitch.conf.backup /etc/nsswitch.conf
-		echo "  Restored /etc/nsswitch.conf"
+		log "  Restored /etc/nsswitch.conf"
 	fi
 
 	rm -rf "$DEPLOY_ROOT"
 	if id "$DEPLOY_USER" &>/dev/null; then userdel -r "$DEPLOY_USER"; fi
 
-	echo "✅ Uninstalled"
+	log "✅ Uninstalled"
 }
 
 cmd_help() {
@@ -693,5 +697,5 @@ case "${1:-help}" in
 	_deploy-app)     shift; cmd__deploy-app "$@" ;;
 	_sync)           shift; cmd__sync "$@" ;;
 	help|--help|-h)  cmd_help ;;
-	*)               echo "Unknown command: $1"; echo "Run \"deploy help\" for usage"; exit 1 ;;
+	*)               die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac
