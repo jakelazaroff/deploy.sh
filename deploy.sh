@@ -24,6 +24,12 @@ json_str() {
 	printf '"%s"' "$s"
 }
 
+# Build a JSON array from arguments
+json_arr() { local out='[' sep=''; for item in "$@"; do out+="$sep$(json_str "$item")"; sep=','; done; printf '%s]' "$out"; }
+
+# Return a JSON string, or null if the argument is empty
+json_nullable() { [ -n "$1" ] && json_str "$1" || printf 'null'; }
+
 # Print an error and exit (JSON-aware)
 die() {
 	if $FMT_JSON; then printf '{"ok":false,"error":%s}\n' "$(json_str "$1")"
@@ -260,9 +266,7 @@ cmd_list() {
 		[ -d "$app_dir" ] && names+=("$(basename "$app_dir")")
 	done
 	if $FMT_JSON; then
-		local out='[' sep=''
-		for name in "${names[@]}"; do out+="$sep$(json_str "$name")"; sep=','; done
-		printf '%s]\n' "$out"
+		printf '%s\n' "$(json_arr "${names[@]}")"
 	else
 		printf '%s\n' "${names[@]}"
 	fi
@@ -310,13 +314,11 @@ cmd_info() {
 		return
 	fi
 
-	local type="null" status="null" command="null" last_deployed="null"
-	local domains_json="null" assets_json="null" spa_json="false"
+	local deployed_at=""
+	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
 
-	if [ -n "$release_name" ]; then
-		local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-		last_deployed=$(json_str "$deployed_at")
-	fi
+	local type="null" status="null" command="null" domains_json="null" assets_json="null" spa_json="false"
+	local last_deployed; last_deployed=$(json_nullable "$deployed_at")
 
 	if [ -f "$deployfile" ]; then
 		local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
@@ -331,17 +333,13 @@ cmd_info() {
 
 		local domains=()
 		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
-		if [ ${#domains[@]} -gt 0 ]; then
-			local out='[' sep=''
-			for d in "${domains[@]}"; do out+="$sep$(json_str "$d")"; sep=','; done
-			domains_json="$out]"
-		fi
+		[ ${#domains[@]} -gt 0 ] && domains_json=$(json_arr "${domains[@]}")
 
 		local assets; assets=$(get_conf "$deployfile" "assets")
-		if [ -n "$assets" ]; then assets_json=$(json_str "$assets"); fi
+		assets_json=$(json_nullable "$assets")
 
 		local spa; spa=$(get_conf "$deployfile" "spa")
-		if [ "$spa" = "true" ]; then spa_json="true"; fi
+		[ "$spa" = "true" ] && spa_json="true"
 	fi
 
 	printf '{"name":%s,"type":%s,"status":%s,"command":%s,"last_deployed":%s,"domains":%s,"assets":%s,"spa":%s}\n' \
@@ -448,7 +446,7 @@ cmd_remove() {
 	ok "✅ Removed $app_name"
 }
 
-cmd__deploy-app() {
+cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
@@ -501,12 +499,12 @@ cmd__deploy-app() {
 		log "✅ Build complete"
 	fi
 
-	cmd__sync "$app_name"
+	cmd_internal_sync "$app_name"
 	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
 	log "🧹 Cleaned up old releases"
 }
 
-cmd__sync() {
+cmd_internal_sync() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
@@ -516,7 +514,6 @@ cmd__sync() {
 	local port; port=$(assign_port "$app_name")
 
 	log "🔄 Syncing configuration for $app_name..."
-	log "  📝 Generating Caddy config..."
 	> "$app_dir/caddy.conf"
 
 	local domains; domains=$(get_conf_all "$deployfile" "domain")
@@ -539,22 +536,14 @@ cmd__sync() {
 		caddyconf+="    log { output file $DEPLOY_ROOT/.internal/access.log }"
 		local host="${domains//$'\n'/, }"
 		printf '%s {\n%s\n}\n' "$host" "$caddyconf" >> "$app_dir/caddy.conf"
-		log "    Configured domain(s): $host"
-		if [ -n "$static_dir" ]; then log "    Assets directory: $static_dir"; fi
-		if [ "$spa_mode" = "true" ]; then log "    SPA mode: enabled"; fi
-	else
-		log "    No domains configured"
 	fi
 
 	if ! $is_static; then
-		log "  📝 Generating .nspawn config..."
 		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
 		printf '[Exec]\nBoot=no\nParameters=/app/start.sh\n' > "$nspawn_file"
 
-		local env_count=0
 		while IFS= read -r env_var; do
 			echo "Environment=\"$env_var\"" >> "$nspawn_file"
-			((++env_count))
 		done < <(get_conf_all "$app_conf" "env")
 
 		cat >> "$nspawn_file" <<-NSPAWN
@@ -685,8 +674,8 @@ case "${1:-help}" in
 	restart)         shift; cmd_restart "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
 	uninstall)       cmd_uninstall ;;
-	_deploy-app)     shift; cmd__deploy-app "$@" ;;
-	_sync)           shift; cmd__sync "$@" ;;
+	_deploy-app)     shift; cmd_internal_deploy-app "$@" ;;
+	_sync)           shift; cmd_internal_sync "$@" ;;
 	help|--help|-h)  cmd_help ;;
 	*)               die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac
