@@ -364,21 +364,6 @@ cmd_remove() {
 	echo "✅ Removed $app_name"
 }
 
-cmd_shell() {
-	require_arg "$1" "Usage: deploy shell <app-name>"
-	if [ ! -d "$DEPLOY_ROOT/$1/machine" ]; then echo "⚠️ Container for $1 does not exist"; exit 1; fi
-	require_root shell "$@"
-	echo "🐚 Entering container for $1..."
-	local leader
-	leader=$(machinectl show "deploy-$1" -p Leader --value 2>/dev/null)
-	if [ -n "$leader" ] && [ "$leader" -gt 0 ] 2>/dev/null; then
-		nsenter -t "$leader" -m -u -i -p --root --wd=/ -- /bin/bash 2>/dev/null || \
-		nsenter -t "$leader" -m -u -i -p --root --wd=/ -- /bin/sh
-	else
-		systemd-nspawn -D "$DEPLOY_ROOT/$1/machine" --machine="deploy-$1"
-	fi
-}
-
 cmd__deploy-app() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
@@ -624,7 +609,6 @@ cmd_help() {
 	  deploy info <name>                  Show app info
 	  deploy logs <name> [options...]     Show app logs
 	  deploy requests <name> [options...] Show app requests
-	  deploy shell <name>                 Shell into container
 	  deploy restart <name>               Restart an app
 	  deploy remove <name>                Remove an app
 	  deploy uninstall                    Remove all deploy.sh system changes
@@ -648,7 +632,6 @@ case "${1:-help}" in
 	info)            shift; cmd_info "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
 	requests)        shift; cmd_requests "$@" ;;
-	shell)           shift; cmd_shell "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
 	uninstall)       cmd_uninstall ;;
