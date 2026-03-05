@@ -434,76 +434,33 @@ cmd__sync() {
 	echo "🔄 Syncing configuration for $app_name..."
 	echo "  📝 Generating Caddy config..."
 	> "$app_dir/caddy.conf"
-	local domains=()
-	while IFS= read -r domain; do domains+=("$domain"); done < <(get_conf_all "$deployfile" "domain")
-	local static_dir=$(get_conf "$deployfile" "assets")
-	local spa_mode=$(get_conf "$deployfile" "spa")
 
-	for domain in "${domains[@]}"; do
+	local domains; domains=$(get_conf_all "$deployfile" "domain")
+	if [ -n "$domains" ]; then
+		local static_dir=$(get_conf "$deployfile" "assets")
+		local caddyconf="    root * $app_dir/current${static_dir:+/$static_dir}"$'\n'
+
+		local spa_mode=$(get_conf "$deployfile" "spa")
 		if $is_static; then
-			local root_path="$app_dir/current"
-			if [ -n "$static_dir" ]; then root_path="$app_dir/current/$static_dir"; fi
-
-			if [ "$spa_mode" = "true" ]; then
-				cat >> "$app_dir/caddy.conf" <<-CADDY
-				$domain {
-				    root * $root_path
-				    try_files {path} /index.html
-				    file_server
-				    encode gzip
-				    log {
-				        output file $DEPLOY_ROOT/.internal/access.log
-				    }
-				}
-				CADDY
-			else
-				cat >> "$app_dir/caddy.conf" <<-CADDY
-				$domain {
-				    root * $root_path
-				    file_server
-				    encode gzip
-				    log {
-				        output file $DEPLOY_ROOT/.internal/access.log
-				    }
-				}
-				CADDY
-			fi
+			[ "$spa_mode" = "true" ] && caddyconf+="    try_files {path} /index.html"$'\n'
+			caddyconf+="    file_server"$'\n'
+			caddyconf+="    encode gzip"$'\n'
+		elif [ -n "$static_dir" ]; then
+			caddyconf+="    @static file"$'\n'
+			caddyconf+="    handle @static { file_server; encode gzip }"$'\n'
+			caddyconf+="    handle { reverse_proxy localhost:$port }"$'\n'
 		else
-			if [ -n "$static_dir" ]; then
-				cat >> "$app_dir/caddy.conf" <<-CADDY
-				$domain {
-				    root * $app_dir/current/$static_dir
-
-				    @static file
-				    handle @static {
-				        file_server
-				        encode gzip
-				    }
-
-				    handle {
-				        reverse_proxy localhost:$port
-				    }
-
-				    log {
-				        output file $DEPLOY_ROOT/.internal/access.log
-				    }
-				}
-				CADDY
-			else
-				cat >> "$app_dir/caddy.conf" <<-CADDY
-				$domain {
-				    reverse_proxy localhost:$port
-				    log {
-				        output file $DEPLOY_ROOT/.internal/access.log
-				    }
-				}
-				CADDY
-			fi
+			caddyconf+="    reverse_proxy localhost:$port"$'\n'
 		fi
-	done
-	[ ${#domains[@]} -gt 0 ] && echo "    Configured ${#domains[@]} domain(s): ${domains[*]}" || echo "    No domains configured"
-	if [ -n "$static_dir" ]; then echo "    Assets directory: $static_dir"; fi
-	if [ "$spa_mode" = "true" ]; then echo "    SPA mode: enabled"; fi
+		caddyconf+="    log { output file $DEPLOY_ROOT/.internal/access.log }"
+		local host="${domains//$'\n'/, }"
+		printf '%s {\n%s\n}\n' "$host" "$caddyconf" >> "$app_dir/caddy.conf"
+		echo "    Configured domain(s): $host"
+		if [ -n "$static_dir" ]; then echo "    Assets directory: $static_dir"; fi
+		if [ "$spa_mode" = "true" ]; then echo "    SPA mode: enabled"; fi
+	else
+		echo "    No domains configured"
+	fi
 
 	if ! $is_static; then
 		echo "  📝 Generating .nspawn config..."
