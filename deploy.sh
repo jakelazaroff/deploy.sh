@@ -17,13 +17,30 @@ DEPLOY_USER=deploy
 
 # UTILITIES
 
+# Escape a string for embedding in JSON
+json_str() {
+	local s="$1"
+	s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/\\t}"
+	printf '"%s"' "$s"
+}
+
+# Print an error and exit (JSON-aware)
+die() {
+	if $FMT_JSON; then printf '{"ok":false,"error":%s}\n' "$(json_str "$1")"
+	else echo "⚠️ $1"; fi
+	exit 1
+}
+
 # Require an argument or exit with usage message
 require_arg() {
 	local arg=$1 usage=$2
-	if [ -z "$arg" ]; then echo "$usage"; exit 1; fi
+	if [ -z "$arg" ]; then die "$usage"; fi
 }
 
-require_root() { if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi; }
+require_root() { if [ "$(id -u)" -ne 0 ]; then
+	if $FMT_JSON; then exec sudo "$0" --json "$@"
+	else exec sudo "$0" "$@"; fi
+fi; }
 
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
@@ -232,50 +249,106 @@ cmd_create() {
 }
 
 cmd_list() {
-	for app_dir in "$DEPLOY_ROOT"/*/; do
-		if [ ! -d "$app_dir" ]; then continue; fi
-		echo $(basename "$app_dir")
-	done
+	if $FMT_JSON; then
+		local first=true
+		printf '['
+		for app_dir in "$DEPLOY_ROOT"/*/; do
+			if [ ! -d "$app_dir" ]; then continue; fi
+			$first || printf ','
+			printf '%s' "$(json_str "$(basename "$app_dir")")"
+			first=false
+		done
+		printf ']\n'
+	else
+		for app_dir in "$DEPLOY_ROOT"/*/; do
+			if [ ! -d "$app_dir" ]; then continue; fi
+			echo $(basename "$app_dir")
+		done
+	fi
 }
 
 cmd_info() {
 	require_arg "$1" "Usage: deploy info <app-name>"
 	local app_name=$1 app_dir="$DEPLOY_ROOT/$1"
-	if [ ! -d "$app_dir" ]; then echo "⚠️ App $app_name does not exist"; exit 1; fi
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local deployfile="$app_dir/current/deploy.conf"
 	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
 
-	echo -e "\e[1m$app_name\e[0m"
+	if $FMT_JSON; then
+		local type="null" status="null" command="null" last_deployed="null"
+		local domains_json="null" assets_json="null" spa_json="false"
 
-	if [ -n "$release_name" ]; then
-		local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-		echo "┆ Last deployed: $deployed_at"
-	fi
+		if [ -n "$release_name" ]; then
+			local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+			last_deployed=$(json_str "$deployed_at")
+		fi
 
-	if [ ! -f "$deployfile" ]; then echo "┆ Not yet deployed"; return; fi
+		if [ -f "$deployfile" ]; then
+			local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
+			if [ -n "$start_cmd" ]; then
+				local svc_status; svc_status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+				type=$(json_str "container")
+				status=$(json_str "$svc_status")
+				command=$(json_str "$start_cmd")
+			else
+				type=$(json_str "static")
+			fi
 
-	local start_cmd=$(get_conf "$deployfile" "start")
-	if [ -n "$start_cmd" ]; then
-		local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
-		echo "┆ Type:    container ($status)"
-		echo "┆ Command: $start_cmd"
+			local domains=()
+			while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
+			if [ ${#domains[@]} -gt 0 ]; then
+				domains_json="["
+				local first=true
+				for d in "${domains[@]}"; do
+					$first || domains_json+=","
+					domains_json+=$(json_str "$d")
+					first=false
+				done
+				domains_json+="]"
+			fi
+
+			local assets; assets=$(get_conf "$deployfile" "assets")
+			if [ -n "$assets" ]; then assets_json=$(json_str "$assets"); fi
+
+			local spa; spa=$(get_conf "$deployfile" "spa")
+			if [ "$spa" = "true" ]; then spa_json="true"; fi
+		fi
+
+		printf '{"name":%s,"type":%s,"status":%s,"command":%s,"last_deployed":%s,"domains":%s,"assets":%s,"spa":%s}\n' \
+			"$(json_str "$app_name")" "$type" "$status" "$command" "$last_deployed" "$domains_json" "$assets_json" "$spa_json"
 	else
-		echo "┆ Type:    static"
+		echo -e "\e[1m$app_name\e[0m"
+
+		if [ -n "$release_name" ]; then
+			local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+			echo "┆ Last deployed: $deployed_at"
+		fi
+
+		if [ ! -f "$deployfile" ]; then echo "┆ Not yet deployed"; return; fi
+
+		local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
+		if [ -n "$start_cmd" ]; then
+			local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+			echo "┆ Type:    container ($status)"
+			echo "┆ Command: $start_cmd"
+		else
+			echo "┆ Type:    static"
+		fi
+
+		local domains=()
+		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
+		if [ ${#domains[@]} -gt 0 ]; then
+			echo "┆ Domains:"
+			for d in "${domains[@]}"; do echo "┆   $d"; done
+		fi
+
+		local assets; assets=$(get_conf "$deployfile" "assets")
+		if [ -n "$assets" ]; then echo "┆ Assets:  $assets"; fi
+
+		local spa; spa=$(get_conf "$deployfile" "spa")
+		if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
 	fi
-
-	local domains=()
-	while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
-	if [ ${#domains[@]} -gt 0 ]; then
-		echo "┆ Domains:"
-		for d in "${domains[@]}"; do echo "┆   $d"; done
-	fi
-
-	local assets=$(get_conf "$deployfile" "assets")
-	if [ -n "$assets" ]; then echo "┆ Assets:  $assets"; fi
-
-	local spa=$(get_conf "$deployfile" "spa")
-	if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
 }
 
 cmd_logs() {
@@ -287,7 +360,11 @@ Examples:
   deploy logs myapi --since '1 hour ago'"
 	require_root logs "$@"
 	local app_name=$1; shift
-	journalctl --no-pager -u "deploy@$app_name" "$@"
+	if $FMT_JSON; then
+		journalctl --no-pager -u "deploy@$app_name" -o json "$@"
+	else
+		journalctl --no-pager -u "deploy@$app_name" "$@"
+	fi
 }
 
 cmd_requests() {
@@ -343,25 +420,37 @@ Examples:
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
 	require_root restart "$@"
-	echo "🔄 Restarting $1..."
-	systemctl restart "deploy@$1"
-	echo "✅ Restarted"
+	if $FMT_JSON; then
+		systemctl restart "deploy@$1" && printf '{"ok":true}\n' || printf '{"ok":false,"error":%s}\n' "$(json_str "Failed to restart $1")"
+	else
+		echo "🔄 Restarting $1..."
+		systemctl restart "deploy@$1"
+		echo "✅ Restarted"
+	fi
 }
 
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [ ! -d "$app_dir" ]; then echo "⚠️ App $app_name does not exist"; exit 1; fi
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
-	echo "🗑️  Removing app: $app_name"
-	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then echo "  Stopping service..."; systemctl stop "deploy@$app_name"; fi
+	if ! $FMT_JSON; then echo "🗑️  Removing app: $app_name"; fi
+	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
+		if ! $FMT_JSON; then echo "  Stopping service..."; fi
+		systemctl stop "deploy@$app_name"
+	fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
-	if [ -f "$app_dir/caddy.conf" ]; then echo "  Removing from Caddy..."; caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
-	echo "  Removing app files..." && rm -rf "$app_dir"
+	if [ -f "$app_dir/caddy.conf" ]; then
+		if ! $FMT_JSON; then echo "  Removing from Caddy..."; fi
+		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
+	fi
+	if ! $FMT_JSON; then echo "  Removing app files..."; fi
+	rm -rf "$app_dir"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
-	echo "✅ Removed $app_name"
+	if $FMT_JSON; then printf '{"ok":true}\n'
+	else echo "✅ Removed $app_name"; fi
 }
 
 cmd__deploy-app() {
@@ -573,11 +662,20 @@ cmd_help() {
 	HELP
 }
 
+FMT_JSON=false
+_args=()
+for _arg in "$@"; do
+	[ "$_arg" = "--json" ] && FMT_JSON=true || _args+=("$_arg")
+done
+set -- "${_args[@]+"${_args[@]}"}"
+unset _args _arg
+
 case "${1:-}" in
 	init|uninstall|_*|help|--help|-h|"") ;;
 	*)
 		if [ "$(id -un)" != "$DEPLOY_USER" ] && [ "$(id -u)" -ne 0 ]; then
-			exec sudo -u "$DEPLOY_USER" "$0" "$@"
+			if $FMT_JSON; then exec sudo -u "$DEPLOY_USER" "$0" --json "$@"
+			else exec sudo -u "$DEPLOY_USER" "$0" "$@"; fi
 		fi
 		;;
 esac
