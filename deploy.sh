@@ -524,21 +524,21 @@ cmd_internal_sync() {
 		cat > "$app_dir/caddy.conf" <<-CADDY
 		$host {
 		    root * $app_dir/current${static_dir:+/$static_dir}
-		$(	if $is_static; then
-				[ "$spa_mode" = "true" ] && echo "    try_files {path} /index.html"
-				cat <<-'HANDLER'
-				    file_server
-				    encode gzip
-				HANDLER
-			elif [ -n "$static_dir" ]; then
-				cat <<-HANDLER
-				    @static file
-				    handle @static { file_server; encode gzip }
-				    handle { reverse_proxy localhost:$port }
-				HANDLER
-			else
-				echo "    reverse_proxy localhost:$port"
-			fi)
+		$(if $is_static; then
+			[ "$spa_mode" = "true" ] && echo "    try_files {path} /index.html"
+			cat <<-'HANDLER'
+			    file_server
+			    encode gzip
+			HANDLER
+		elif [ -n "$static_dir" ]; then
+			cat <<-HANDLER
+			    @static file
+			    handle @static { file_server; encode gzip }
+			    handle { reverse_proxy localhost:$port }
+			HANDLER
+		else
+			echo "    reverse_proxy localhost:$port"
+		fi)
 		    log { output file $DEPLOY_ROOT/.internal/access.log }
 		}
 		CADDY
@@ -547,20 +547,14 @@ cmd_internal_sync() {
 	fi
 
 	if ! $is_static; then
-		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
-		cat > "$nspawn_file" <<-NSPAWN
-		[Exec]
-		Boot=no
-		Parameters=/app/start.sh
-		$(	while IFS= read -r env_var; do
+		local env_lines; env_lines=$(
+			while IFS= read -r env_var; do
 				printf 'Environment="%s"\n' "$env_var"
-			done < <(get_conf_all "$app_conf" "env"))
+			done < <(get_conf_all "$app_conf" "env")
+		)
 
-		[Files]
-		Bind=$app_dir/current:/app
-		BindReadOnly=$app_dir/start.sh:/app/start.sh
-		BindReadOnly=/etc/resolv.conf
-		$(	while IFS= read -r mount; do
+		local mount_lines; mount_lines=$(
+			while IFS= read -r mount; do
 				if [[ "$mount" =~ ^([^:]+):([^:]+):ro$ ]]; then
 					host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}" readonly="ReadOnly"
 				elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
@@ -570,7 +564,21 @@ cmd_internal_sync() {
 				fi
 				[ ! -e "$host_path" ] && { log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
 				printf 'Bind%s=%s:%s\n' "$readonly" "$host_path" "$container_path"
-			done < <(get_conf_all "$app_conf" "mount"))
+			done < <(get_conf_all "$app_conf" "mount")
+		)
+
+		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
+		cat > "$nspawn_file" <<-NSPAWN
+		[Exec]
+		Boot=no
+		Parameters=/app/start.sh
+		$env_lines
+
+		[Files]
+		Bind=$app_dir/current:/app
+		BindReadOnly=$app_dir/start.sh:/app/start.sh
+		BindReadOnly=/etc/resolv.conf
+		$mount_lines
 
 		[Network]
 		Private=no
