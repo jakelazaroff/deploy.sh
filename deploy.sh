@@ -341,6 +341,40 @@ cmd_requests() {
 	'
 }
 
+cmd_conf() {
+	require_arg "$1" "Usage: deploy conf <app-name> [--edit]"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
+	require_root conf "$@"
+	local app_conf="$app_dir/server.conf"
+
+	if [ "${2:-}" = "--edit" ]; then
+		if [ ! -f "$app_dir/current/deploy.conf" ]; then die "App $app_name has not been deployed yet"; fi
+		touch "$app_conf"
+		if $FMT_JSON; then
+			cat > "$app_conf"
+		else
+			${EDITOR:-${VISUAL:-vi}} "$app_conf"
+		fi
+		cmd_internal_sync "$app_name"
+		ok "Configuration updated"
+	else
+		local envs=() mounts=()
+		if [ -f "$app_conf" ]; then
+			while IFS= read -r e; do envs+=("$e"); done < <(get_conf_all "$app_conf" "env")
+			while IFS= read -r m; do mounts+=("$m"); done < <(get_conf_all "$app_conf" "mount")
+		fi
+		if $FMT_JSON; then
+			local env_json="[]" mounts_json="[]"
+			[ ${#envs[@]} -gt 0 ] && env_json=$(json_arr "${envs[@]}")
+			[ ${#mounts[@]} -gt 0 ] && mounts_json=$(json_arr "${mounts[@]}")
+			printf '{"ok":true,"env":%s,"mounts":%s}\n' "$env_json" "$mounts_json"
+		else
+			if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
+		fi
+	fi
+}
+
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
 	require_root restart "$@"
@@ -567,6 +601,7 @@ cmd_help() {
 	  deploy create <name>                Create a new app
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
+	  deploy conf <name> [--edit]          Show server.conf (--edit to open in $EDITOR and sync)
 	  deploy logs <name> [options...]     Show app logs (passes options to journalctl)
 	  deploy requests <name> [options...] Show HTTP access logs (-f, --since, --before)
 	  deploy restart <name>               Restart an app
@@ -609,6 +644,7 @@ case "${1:-help}" in
 	create)          shift; cmd_create "$@" ;;
 	list)            cmd_list ;;
 	info)            shift; cmd_info "$@" ;;
+	conf)            shift; cmd_conf "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
 	requests)        shift; cmd_requests "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
