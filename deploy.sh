@@ -43,11 +43,7 @@ log() { $FMT_JSON || echo "$@" >&2; }
 # Print a success result; emits {"ok":true} in JSON mode
 ok() { $FMT_JSON && printf '{"ok":true}\n' || log "$1"; }
 
-# Require an argument or exit with usage message
-require_arg() {
-	local arg=$1 usage=$2
-	if [ -z "$arg" ]; then die "$usage"; fi
-}
+require_arg() { [ -n "$1" ] || die "$2"; }
 
 require_root() { if [ "$(id -u)" -ne 0 ]; then
 	if $FMT_JSON; then exec sudo "$0" --json "$@"
@@ -92,15 +88,6 @@ assign_port() {
 	while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
 	echo "$app_name=$port" >> "$ports_file"
 	echo "$port"
-}
-
-validate_deployconf() {
-	local file=$1 app_name=$2
-	if [ ! -f "$file" ]; then return 0; fi
-
-	while IFS= read -r domain; do
-		check_domain_collision "$domain" "$app_name"
-	done < <(get_conf_all "$file" "domain")
 }
 
 # SUBCOMMANDS
@@ -235,32 +222,13 @@ cmd_create() {
 	chmod +x hooks/post-receive
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 
-	cat >&2 <<-MSG
-	✅ Created app: $app_name
-
-	Add a deploy.conf to your repo root:
-
-	  For a container app:
-	    start=npm start
-	    build=npm ci && npm run build
-	    domain=yourdomain.com
-	    assets=public
-
-	  For a static site:
-	    domain=yourdomain.com
-	    build=npm ci && npm run build
-	    assets=dist
-	    spa=true
-
-	Next steps:
-	  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git
-	  git push deploy main
-
-	To configure mounts or environment variables, create $app_dir/server.conf on the server:
-	  mount=/data/uploads:/app/uploads    # read-write mount
-	  mount=/etc/secrets:/app/secrets:ro  # read-only mount (:ro)
-	  env=SECRET_KEY=...                  # environment variable (passed to container and build)
-	MSG
+	log "✅ Created app: $app_name"
+	log ""
+	log "Next steps:"
+	log "  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git"
+	log "  git push deploy main"
+	log ""
+	log "See 'deploy help' for deploy.conf format."
 }
 
 cmd_list() {
@@ -282,80 +250,49 @@ cmd_info() {
 
 	local deployfile="$app_dir/current/deploy.conf"
 	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
+	local deployed_at=""
+	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+
+	local start_cmd="" status="" domains=() assets="" spa=""
+	if [ -f "$deployfile" ]; then
+		start_cmd=$(get_conf "$deployfile" "start")
+		[ -n "$start_cmd" ] && status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
+		assets=$(get_conf "$deployfile" "assets")
+		spa=$(get_conf "$deployfile" "spa")
+	fi
 
 	if ! $FMT_JSON; then
 		echo -e "\e[1m$app_name\e[0m"
-
-		if [ -n "$release_name" ]; then
-			local deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-			echo "┆ Last deployed: $deployed_at"
-		fi
-
+		[ -n "$deployed_at" ] && echo "┆ Last deployed: $deployed_at"
 		if [ ! -f "$deployfile" ]; then echo "┆ Not yet deployed"; return; fi
-
-		local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
 		if [ -n "$start_cmd" ]; then
-			local status; status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
 			echo "┆ Type:    container ($status)"
 			echo "┆ Command: $start_cmd"
 		else
 			echo "┆ Type:    static"
 		fi
-
-		local domains=()
-		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
-		if [ ${#domains[@]} -gt 0 ]; then
-			echo "┆ Domains:"
-			for d in "${domains[@]}"; do echo "┆   $d"; done
-		fi
-
-		local assets; assets=$(get_conf "$deployfile" "assets")
-		if [ -n "$assets" ]; then echo "┆ Assets:  $assets"; fi
-
-		local spa; spa=$(get_conf "$deployfile" "spa")
-		if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
+		if [ ${#domains[@]} -gt 0 ]; then echo "┆ Domains:"; for d in "${domains[@]}"; do echo "┆   $d"; done; fi
+		[ -n "$assets" ] && echo "┆ Assets:  $assets"
+		[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 		return
 	fi
 
-	local deployed_at=""
-	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
-
-	local type="null" status="null" command="null" domains_json="null" assets_json="null" spa_json="false"
-	local last_deployed; last_deployed=$(json_nullable "$deployed_at")
-
-	if [ -f "$deployfile" ]; then
-		local start_cmd; start_cmd=$(get_conf "$deployfile" "start")
-		if [ -n "$start_cmd" ]; then
-			local svc_status; svc_status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
-			type=$(json_str "container")
-			status=$(json_str "$svc_status")
-			command=$(json_str "$start_cmd")
-		else
-			type=$(json_str "static")
-		fi
-
-		local domains=()
-		while IFS= read -r d; do domains+=("$d"); done < <(get_conf_all "$deployfile" "domain")
-		[ ${#domains[@]} -gt 0 ] && domains_json=$(json_arr "${domains[@]}")
-
-		local assets; assets=$(get_conf "$deployfile" "assets")
-		assets_json=$(json_nullable "$assets")
-
-		local spa; spa=$(get_conf "$deployfile" "spa")
-		[ "$spa" = "true" ] && spa_json="true"
+	local type="null" cmd_json="null" status_json="null" domains_json="null"
+	if [ -n "$start_cmd" ]; then
+		type=$(json_str "container"); status_json=$(json_str "$status"); cmd_json=$(json_str "$start_cmd")
+	elif [ -f "$deployfile" ]; then
+		type=$(json_str "static")
 	fi
+	[ ${#domains[@]} -gt 0 ] && domains_json=$(json_arr "${domains[@]}")
 
 	printf '{"name":%s,"type":%s,"status":%s,"command":%s,"last_deployed":%s,"domains":%s,"assets":%s,"spa":%s}\n' \
-		"$(json_str "$app_name")" "$type" "$status" "$command" "$last_deployed" "$domains_json" "$assets_json" "$spa_json"
+		"$(json_str "$app_name")" "$type" "$status_json" "$cmd_json" "$(json_nullable "$deployed_at")" \
+		"$domains_json" "$(json_nullable "$assets")" "$( [ "$spa" = "true" ] && echo true || echo false)"
 }
 
 cmd_logs() {
-	require_arg "$1" "Usage: deploy logs <app-name> [journalctl-options...]
-
-Examples:
-  deploy logs myapi
-  deploy logs myapi -f
-  deploy logs myapi --since '1 hour ago'"
+	require_arg "$1" "Usage: deploy logs <app-name> [journalctl-options...]"
 	require_root logs "$@"
 	local app_name=$1; shift
 	if $FMT_JSON; then
@@ -366,18 +303,7 @@ Examples:
 }
 
 cmd_requests() {
-	require_arg "$1" "Usage: deploy requests <app-name> [options...]
-
-Options:
-  -f                  Follow log output
-  --since <date>      Show requests since date
-  --before <date>     Show requests before date
-
-Examples:
-  deploy requests myapp
-  deploy requests myapp -f
-  deploy requests myapp --since '1 hour ago'
-  deploy requests myapp --since '2026-03-01 10:00' --before '2026-03-01 11:00'"
+	require_arg "$1" "Usage: deploy requests <app-name> [-f] [--since <date>] [--before <date>]"
 	require_root requests "$@"
 	local app_name=$1; shift
 	local log_file="$DEPLOY_ROOT/.internal/access.log"
@@ -484,21 +410,16 @@ cmd_internal_deploy-app() {
 
 	if [ -n "$build_cmd" ]; then
 		local build_dir="$app_dir/machine-build"
-		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
+		rm -rf "$build_dir"
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
-
+		log "🔧 Running build..."
+		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
 		if [ -n "$start_cmd" ]; then
-			log "🔧 Running build..."
-			systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-			log "🔄 Swapping container..."
 			systemctl stop "deploy@$app_name" 2>/dev/null || true
 			rm -rf "$app_dir/machine"
 			mv "$build_dir" "$app_dir/machine"
 		else
-			log "🔧 Running static site build in ephemeral container..."
-			systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
 			rm -rf "$build_dir"
-			log "✅ Build complete"
 		fi
 	fi
 
@@ -513,7 +434,9 @@ cmd_internal_sync() {
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
-	validate_deployconf "$deployfile" "$app_name"
+	while IFS= read -r domain; do
+		check_domain_collision "$domain" "$app_name"
+	done < <(get_conf_all "$deployfile" "domain")
 	local port; port=$(assign_port "$app_name")
 
 	log "🔄 Syncing configuration for $app_name..."
@@ -524,24 +447,19 @@ cmd_internal_sync() {
 	local host="${domains//$'\n'/, }"
 
 	if [ -n "$domains" ]; then
+		local handler
+		if $is_static; then
+			handler="    file_server"$'\n'"    encode gzip"
+			[ "$spa_mode" = "true" ] && handler="    try_files {path} /index.html"$'\n'"$handler"
+		elif [ -n "$static_dir" ]; then
+			handler="    @static file"$'\n'"    handle @static { file_server; encode gzip }"$'\n'"    handle { reverse_proxy localhost:$port }"
+		else
+			handler="    reverse_proxy localhost:$port"
+		fi
 		cat > "$app_dir/caddy.conf" <<-CADDY
 		$host {
 		    root * $app_dir/current${static_dir:+/$static_dir}
-		$(if $is_static; then
-			[ "$spa_mode" = "true" ] && echo "    try_files {path} /index.html"
-			cat <<-'HANDLER'
-			    file_server
-			    encode gzip
-			HANDLER
-		elif [ -n "$static_dir" ]; then
-			cat <<-HANDLER
-			    @static file
-			    handle @static { file_server; encode gzip }
-			    handle { reverse_proxy localhost:$port }
-			HANDLER
-		else
-			echo "    reverse_proxy localhost:$port"
-		fi)
+		$handler
 		    log { output file $DEPLOY_ROOT/.internal/access.log }
 		}
 		CADDY
@@ -649,12 +567,22 @@ cmd_help() {
 	  deploy create <name>                Create a new app
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
-	  deploy logs <name> [options...]     Show app logs
-	  deploy requests <name> [options...] Show app requests
+	  deploy logs <name> [options...]     Show app logs (passes options to journalctl)
+	  deploy requests <name> [options...] Show HTTP access logs (-f, --since, --before)
 	  deploy restart <name>               Restart an app
 	  deploy remove <name>                Remove an app
 	  deploy uninstall                    Remove all deploy.sh system changes
-	  deploy help                         Show this help
+
+	deploy.conf (in repo root):
+	  start=npm start                     Start command (omit for static sites)
+	  build=npm ci && npm run build       Build command (runs in container)
+	  domain=yourdomain.com               Domain (repeatable)
+	  assets=public                       Static assets directory
+	  spa=true                            Single-page app mode
+
+	server.conf (on server, in app directory):
+	  env=SECRET_KEY=...                  Environment variable
+	  mount=/data:/app/data               Bind mount (append :ro for read-only)
 	HELP
 }
 
