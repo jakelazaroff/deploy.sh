@@ -514,65 +514,67 @@ cmd_internal_sync() {
 	local port; port=$(assign_port "$app_name")
 
 	log "🔄 Syncing configuration for $app_name..."
-	> "$app_dir/caddy.conf"
 
 	local domains; domains=$(get_conf_all "$deployfile" "domain")
-	if [ -n "$domains" ]; then
-		local static_dir=$(get_conf "$deployfile" "assets")
-		local caddyconf="    root * $app_dir/current${static_dir:+/$static_dir}"$'\n'
+	local static_dir=$(get_conf "$deployfile" "assets")
+	local spa_mode=$(get_conf "$deployfile" "spa")
+	local host="${domains//$'\n'/, }"
 
-		local spa_mode=$(get_conf "$deployfile" "spa")
-		if $is_static; then
-			[ "$spa_mode" = "true" ] && caddyconf+="    try_files {path} /index.html"$'\n'
-			caddyconf+="    file_server"$'\n'
-			caddyconf+="    encode gzip"$'\n'
-		elif [ -n "$static_dir" ]; then
-			caddyconf+="    @static file"$'\n'
-			caddyconf+="    handle @static { file_server; encode gzip }"$'\n'
-			caddyconf+="    handle { reverse_proxy localhost:$port }"$'\n'
-		else
-			caddyconf+="    reverse_proxy localhost:$port"$'\n'
-		fi
-		caddyconf+="    log { output file $DEPLOY_ROOT/.internal/access.log }"
-		local host="${domains//$'\n'/, }"
-		printf '%s {\n%s\n}\n' "$host" "$caddyconf" >> "$app_dir/caddy.conf"
+	if [ -n "$domains" ]; then
+		cat > "$app_dir/caddy.conf" <<-CADDY
+		$host {
+		    root * $app_dir/current${static_dir:+/$static_dir}
+		$(	if $is_static; then
+				[ "$spa_mode" = "true" ] && echo "    try_files {path} /index.html"
+				cat <<-'HANDLER'
+				    file_server
+				    encode gzip
+				HANDLER
+			elif [ -n "$static_dir" ]; then
+				cat <<-HANDLER
+				    @static file
+				    handle @static { file_server; encode gzip }
+				    handle { reverse_proxy localhost:$port }
+				HANDLER
+			else
+				echo "    reverse_proxy localhost:$port"
+			fi)
+		    log { output file $DEPLOY_ROOT/.internal/access.log }
+		}
+		CADDY
+	else
+		> "$app_dir/caddy.conf"
 	fi
 
 	if ! $is_static; then
 		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
-		printf '[Exec]\nBoot=no\nParameters=/app/start.sh\n' > "$nspawn_file"
-
-		while IFS= read -r env_var; do
-			echo "Environment=\"$env_var\"" >> "$nspawn_file"
-		done < <(get_conf_all "$app_conf" "env")
-
-		cat >> "$nspawn_file" <<-NSPAWN
+		cat > "$nspawn_file" <<-NSPAWN
+		[Exec]
+		Boot=no
+		Parameters=/app/start.sh
+		$(	while IFS= read -r env_var; do
+				printf 'Environment="%s"\n' "$env_var"
+			done < <(get_conf_all "$app_conf" "env"))
 
 		[Files]
 		Bind=$app_dir/current:/app
 		BindReadOnly=$app_dir/start.sh:/app/start.sh
 		BindReadOnly=/etc/resolv.conf
+		$(	while IFS= read -r mount; do
+				if [[ "$mount" =~ ^([^:]+):([^:]+):ro$ ]]; then
+					host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}" readonly="ReadOnly"
+				elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
+					host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}" readonly=""
+				else
+					log "⚠️  Skipping invalid mount: $mount"; continue
+				fi
+				[ ! -e "$host_path" ] && { log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
+				printf 'Bind%s=%s:%s\n' "$readonly" "$host_path" "$container_path"
+			done < <(get_conf_all "$app_conf" "mount"))
 
+		[Network]
+		Private=no
 		NSPAWN
-
-		local mount_count=0
-		while IFS= read -r mount; do
-			local host_path container_path readonly=""
-			if [[ "$mount" =~ ^([^:]+):([^:]+):ro$ ]]; then
-				host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}" readonly="ReadOnly"
-			elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
-				host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
-			else
-				log "⚠️  Skipping invalid mount: $mount"; continue
-			fi
-			if [ ! -e "$host_path" ]; then log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; fi
-			echo "Bind${readonly}=$host_path:$container_path" >> "$nspawn_file"
-			((++mount_count))
-		done < <(get_conf_all "$app_conf" "mount")
-
-		echo -e "\n[Network]\nPrivate=no" >> "$nspawn_file"
-		if [ "$mount_count" -gt 0 ]; then log "    Added $mount_count custom mount(s)"; fi
-		if [ "$env_count" -gt 0 ]; then log "    Added $env_count environment variable(s)"; fi
 
 		cat > "$app_dir/start.sh" <<-STARTSH
 		#!/bin/bash
@@ -583,8 +585,7 @@ cmd_internal_sync() {
 		chmod +x "$app_dir/start.sh"
 	fi
 
-	log "  🔄 Reloading services..."
-	[ ${#domains[@]} -gt 0 ] && caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
+	[ -n "$domains" ] && caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	if ! $is_static; then
 		systemctl daemon-reload
 		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
