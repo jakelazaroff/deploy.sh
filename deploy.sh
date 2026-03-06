@@ -207,7 +207,7 @@ cmd_init() {
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
@@ -245,7 +245,7 @@ cmd_list() {
 
 cmd_info() {
 	require_arg "$1" "Usage: deploy info <app-name>"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/$1"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local deployfile="$app_dir/current/deploy.conf"
@@ -343,7 +343,7 @@ cmd_requests() {
 
 cmd_conf() {
 	require_arg "$1" "Usage: deploy conf <app-name> [--edit]"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$1"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root conf "$@"
 	local app_conf="$app_dir/server.conf"
@@ -388,7 +388,7 @@ cmd_restart() {
 
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
 	log "🗑️  Removing app: $app_name"
@@ -411,7 +411,7 @@ cmd_remove() {
 
 cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
@@ -464,7 +464,7 @@ cmd_internal_deploy-app() {
 
 cmd_internal_sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
