@@ -106,7 +106,7 @@ validate_deployconf() {
 # SUBCOMMANDS
 
 cmd_init() {
-	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy init must be run as root" >&2; exit 1; fi
+	if [ "$(id -u)" -ne 0 ]; then die "deploy init must be run as root"; fi
 	log "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	if ! command -v systemd-nspawn &>/dev/null; then
@@ -141,7 +141,6 @@ cmd_init() {
 
 	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
-
 
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
 		log "📦 Pulling Alpine base image..."
@@ -212,14 +211,18 @@ cmd_init() {
 	chmod 0440 /etc/sudoers.d/deploy
 	log "📝 Created /etc/sudoers.d/deploy"
 
-	log -e "\n✅ System initialized!\n   Location: $DEPLOY_ROOT\n\nNext: deploy create <app-name>"
+	log ""
+	log "✅ System initialized!"
+	log "   Location: $DEPLOY_ROOT"
+	log ""
+	log "Next: deploy create <app-name>"
 }
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [[ "$app_name" == .* ]]; then echo "⚠️ App name cannot start with '.'" >&2; exit 1; fi
-	if [ -d "$app_dir" ]; then echo "⚠️ App $app_name already exists" >&2; exit 1; fi
+	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
+	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
+	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
 	log "📦 Creating app: $app_name"
 	mkdir -p "$app_dir"/{releases,repo.git}
@@ -425,7 +428,7 @@ cmd_restart() {
 
 cmd_remove() {
 	require_arg "$1" "Usage: deploy remove <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
 	log "🗑️  Removing app: $app_name"
@@ -448,7 +451,7 @@ cmd_remove() {
 
 cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
@@ -479,24 +482,24 @@ cmd_internal_deploy-app() {
 		setenv_args+=(--setenv="$env_var")
 	done < <(get_conf_all "$app_conf" "env")
 
-	if [ -n "$start_cmd" ] && [ -n "$build_cmd" ]; then
-		log "🔧 Running build..."
+	if [ -n "$build_cmd" ]; then
 		local build_dir="$app_dir/machine-build"
 		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
-		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-		log "🔄 Swapping container..."
-		systemctl stop "deploy@$app_name" 2>/dev/null || true
-		rm -rf "$app_dir/machine"
-		mv "$build_dir" "$app_dir/machine"
-	elif [ -z "$start_cmd" ] && [ -n "$build_cmd" ]; then
-		log "🔧 Running static site build in ephemeral container..."
-		local build_dir="$app_dir/machine-build"
-		if [ -d "$build_dir" ]; then rm -rf "$build_dir"; fi
-		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
-		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
-		rm -rf "$build_dir"
-		log "✅ Build complete"
+
+		if [ -n "$start_cmd" ]; then
+			log "🔧 Running build..."
+			systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+			log "🔄 Swapping container..."
+			systemctl stop "deploy@$app_name" 2>/dev/null || true
+			rm -rf "$app_dir/machine"
+			mv "$build_dir" "$app_dir/machine"
+		else
+			log "🔧 Running static site build in ephemeral container..."
+			systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+			rm -rf "$build_dir"
+			log "✅ Build complete"
+		fi
 	fi
 
 	cmd_internal_sync "$app_name"
@@ -506,7 +509,7 @@ cmd_internal_deploy-app() {
 
 cmd_internal_sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1 app_dir="$DEPLOY_ROOT/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
@@ -593,7 +596,7 @@ cmd_internal_sync() {
 		chmod +x "$app_dir/start.sh"
 	fi
 
-	[ -n "$domains" ] && caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
+	if [ -n "$domains" ]; then caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
 	if ! $is_static; then
 		systemctl daemon-reload
 		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
@@ -603,7 +606,7 @@ cmd_internal_sync() {
 }
 
 cmd_uninstall() {
-	if [ "$(id -u)" -ne 0 ]; then echo "⚠️ deploy uninstall must be run as root" >&2; exit 1; fi
+	if [ "$(id -u)" -ne 0 ]; then die "deploy uninstall must be run as root"; fi
 	log "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
 	read -rp "Type 'yes' to confirm: " confirm
 	if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
