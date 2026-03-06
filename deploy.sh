@@ -207,6 +207,7 @@ cmd_init() {
 
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
+	require_root create "$@"
 	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
@@ -341,37 +342,28 @@ cmd_requests() {
 	'
 }
 
-cmd_conf() {
-	require_arg "$1" "Usage: deploy conf <app-name> [--edit]"
+cmd_config() {
+	require_arg "$1" "Usage: deploy config <app-name>"
 	local app_name=$1; app_dir="$DEPLOY_ROOT/$1"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
-	require_root conf "$@"
+	require_root config "$@"
 	local app_conf="$app_dir/server.conf"
 
-	if [ "${2:-}" = "--edit" ]; then
-		if [ ! -f "$app_dir/current/deploy.conf" ]; then die "App $app_name has not been deployed yet"; fi
-		touch "$app_conf"
-		if $FMT_JSON; then
-			cat > "$app_conf"
-		else
-			${EDITOR:-${VISUAL:-vi}} "$app_conf"
-		fi
+	if [ ! -t 0 ]; then
+		cat > "$app_conf"
 		cmd_internal_sync "$app_name"
 		ok "Configuration updated"
+	elif [ "${2:-}" = "--edit" ]; then
+		touch "$app_conf"
+		${EDITOR:-${VISUAL:-vi}} "$app_conf"
+		cmd_internal_sync "$app_name"
+		ok "Configuration updated"
+	elif $FMT_JSON; then
+		local content=""
+		[ -f "$app_conf" ] && content=$(cat "$app_conf")
+		printf '{"ok":true,"config":%s}\n' "$(json_str "$content")"
 	else
-		local envs=() mounts=()
-		if [ -f "$app_conf" ]; then
-			while IFS= read -r e; do envs+=("$e"); done < <(get_conf_all "$app_conf" "env")
-			while IFS= read -r m; do mounts+=("$m"); done < <(get_conf_all "$app_conf" "mount")
-		fi
-		if $FMT_JSON; then
-			local env_json="[]" mounts_json="[]"
-			[ ${#envs[@]} -gt 0 ] && env_json=$(json_arr "${envs[@]}")
-			[ ${#mounts[@]} -gt 0 ] && mounts_json=$(json_arr "${mounts[@]}")
-			printf '{"ok":true,"env":%s,"mounts":%s}\n' "$env_json" "$mounts_json"
-		else
-			if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
-		fi
+		if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
 	fi
 }
 
@@ -391,6 +383,8 @@ cmd_remove() {
 	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
+	read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
+	if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 	log "🗑️  Removing app: $app_name"
 	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
 		log "  Stopping service..."
@@ -601,7 +595,7 @@ cmd_help() {
 	  deploy create <name>                Create a new app
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
-	  deploy conf <name> [--edit]          Show server.conf (--edit to open in $EDITOR and sync)
+	  deploy config <name> [--edit]        Show server.conf (--edit to open in $EDITOR, pipe to replace)
 	  deploy logs <name> [options...]     Show app logs (passes options to journalctl)
 	  deploy requests <name> [options...] Show HTTP access logs (-f, --since, --before)
 	  deploy restart <name>               Restart an app
@@ -644,7 +638,7 @@ case "${1:-help}" in
 	create)          shift; cmd_create "$@" ;;
 	list)            cmd_list ;;
 	info)            shift; cmd_info "$@" ;;
-	conf)            shift; cmd_conf "$@" ;;
+	config)          shift; cmd_config "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
 	requests)        shift; cmd_requests "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
