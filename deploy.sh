@@ -132,7 +132,12 @@ cmd_init() {
 
 		(logging) {
 		    log {
+		        output file {args[0]}/access.json.log
+		        format json
+		    }
+		    log {
 		        output file {args[0]}/access.log
+		        format console
 		    }
 		}
 
@@ -294,8 +299,7 @@ cmd_requests() {
 	require_arg "$1" "Usage: deploy requests <app-name> [-f] [--since <date>] [--before <date>]"
 	require_root requests "$@"
 	local app_name=$1; shift
-	local log_file="$DEPLOY_ROOT/.internal/access.log"
-	local app_conf="$DEPLOY_ROOT/$app_name/server.conf"
+	local log_file="$DEPLOY_ROOT/$app_name/access.log"
 	local follow=false since_ts="" before_ts=""
 
 	while [ $# -gt 0 ]; do
@@ -309,20 +313,18 @@ cmd_requests() {
 
 	if [ ! -f "$log_file" ]; then die "No access log found at $log_file"; fi
 
-	local domain; domain=$(get_conf "$app_conf" "domain")
-	if [ -z "$domain" ]; then die "No domain configured for $app_name"; fi
-
-	local pattern="$domain"
+	if [ -z "$since_ts" ] && [ -z "$before_ts" ]; then
+		if $follow; then tail -f "$log_file"; else cat "$log_file"; fi
+		return
+	fi
 
 	if $follow; then tail -f "$log_file"; else cat "$log_file"; fi \
-	| awk -v p="$pattern" -v since="$since_ts" -v before="$before_ts" '
-		$0 ~ p {
-			if (since != "" || before != "") {
-				if (match($0, /"ts":[0-9]+/))
-					ts = substr($0, RSTART+5, RLENGTH-5) + 0
-				if (since  != "" && ts < since+0)  next
-				if (before != "" && ts > before+0) next
-			}
+	| awk -v since="$since_ts" -v before="$before_ts" '
+		{
+			if (match($0, /"ts":[0-9]+/))
+				ts = substr($0, RSTART+5, RLENGTH-5) + 0
+			if (since  != "" && ts < since+0)  next
+			if (before != "" && ts > before+0) next
 			print
 		}
 	'
