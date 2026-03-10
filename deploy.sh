@@ -562,6 +562,7 @@ cmd_internal_sync() {
 			done < <(get_conf_all "$app_conf" "mount")
 		)
 
+		mkdir -p "$app_dir/data"
 		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
 		cat > "$nspawn_file" <<-NSPAWN
 		[Exec]
@@ -571,6 +572,7 @@ cmd_internal_sync() {
 
 		[Files]
 		Bind=$app_dir/current:/app
+		Bind=$app_dir/data:/data
 		BindReadOnly=$app_dir/start.sh:/app/start.sh
 		BindReadOnly=/etc/resolv.conf
 		$mount_lines
