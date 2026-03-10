@@ -381,7 +381,7 @@ cmd_config() {
 	require_root config "$@"
 	local app_conf="$app_dir/server.conf"
 
-	if [ ! -t 0 ]; then
+	if [ "${2:-}" = "--stdin" ]; then
 		cat > "$app_conf"
 		cmd_internal_sync "$app_name"
 		ok "Configuration updated"
