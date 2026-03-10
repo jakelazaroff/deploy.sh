@@ -151,6 +151,38 @@ cmd_init() {
 		    email $acme_email
 		}
 
+		(logging) {
+		    log {
+		        output file {args[0]}/access.log
+		    }
+		}
+
+		(static) {
+		    file_server
+		    encode gzip
+		}
+
+		(proxy) {
+		    reverse_proxy localhost:{args[0]} {
+		        header_up Host {http.request.host}
+		    }
+		}
+
+		(spa) {
+		    try_files {path} /index.html
+		    import static
+		}
+
+		(assets) {
+		    @static file
+		    handle @static {
+		        import static
+		    }
+		    handle {
+		        import proxy {args[0]}
+		    }
+		}
+
 		import $DEPLOY_ROOT/*/caddy.conf
 		CADDY
 		log "📝 Created Caddyfile"
@@ -476,24 +508,38 @@ cmd_internal_sync() {
 
 	if [ -n "$domains" ]; then
 		local handler
-		if $is_static; then
-			handler="    file_server"$'\n'"    encode gzip"
-			[ "$spa_mode" = "true" ] && handler="    try_files {path} /index.html"$'\n'"$handler"
+		if $is_static && [ "$spa_mode" = "true" ]; then
+			handler="import spa"
+		elif $is_static; then
+			handler="import static"
 		elif [ -n "$static_dir" ]; then
-			handler="    @static file"$'\n'"    handle @static { file_server; encode gzip }"$'\n'"    handle { reverse_proxy localhost:$port }"
+			handler="import assets $port"
 		else
-			handler="    reverse_proxy localhost:$port"
+			handler="import proxy $port"
 		fi
+
+		local headers=""
+		while IFS= read -r h; do
+			local path="${h%% *}" rest="${h#* }" name value
+			name="${rest%%:*}"
+			value="${rest#*: }"
+			[[ "$value" == *" "* ]] && value="\"$value\""
+			headers+="    header $path $name $value"$'\n'
+		done < <(get_conf_all "$deployfile" "header")
+
 		cat > "$app_dir/caddy.conf" <<-CADDY
 		$host {
 		    root * $app_dir/current${static_dir:+/$static_dir}
-		$handler
-		    log { output file $DEPLOY_ROOT/.internal/access.log }
+		    $headers
+
+		    $handler
+				import logging "$app_dir"
 		}
 		CADDY
 	else
 		> "$app_dir/caddy.conf"
 	fi
+	caddy fmt "$app_dir/caddy.conf" --overwrite
 
 	if ! $is_static; then
 		local env_lines; env_lines=$(
@@ -608,6 +654,7 @@ cmd_help() {
 	  domain=yourdomain.com               Domain (repeatable)
 	  assets=public                       Static assets directory
 	  spa=true                            Single-page app mode
+	  header=/path Name: value            Response header (repeatable)
 
 	server.conf (on server, in app directory):
 	  env=SECRET_KEY=...                  Environment variable
