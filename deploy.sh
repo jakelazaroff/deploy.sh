@@ -23,9 +23,6 @@ die() { echo "⚠️ $1" >&2; exit 1; }
 # Print a progress message to stderr
 log() { echo "$@" >&2; }
 
-# Print a success message
-ok() { log "$1"; }
-
 require_arg() { [ -n "$1" ] || die "$2"; }
 
 require_root() { if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi; }
@@ -362,15 +359,11 @@ cmd_config() {
 	require_root config "$@"
 	local app_conf="$app_dir/server.conf"
 
-	if [ "${2:-}" = "--stdin" ]; then
-		cat > "$app_conf"
-		cmd_internal_sync "$app_name"
-		ok "Configuration updated"
-	elif [ "${2:-}" = "--edit" ]; then
+	if [ "${2:-}" = "--edit" ]; then
 		touch "$app_conf"
 		${EDITOR:-${VISUAL:-vi}} "$app_conf"
 		cmd_internal_sync "$app_name"
-		ok "Configuration updated"
+		log "Configuration updated"
 	else
 		if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
 	fi
@@ -381,7 +374,7 @@ cmd_restart() {
 	require_root restart "$@"
 	log "🔄 Restarting $1..."
 	if systemctl restart "deploy@$1"; then
-		ok "✅ Restarted"
+		log "✅ Restarted"
 	else
 		die "Failed to restart $1"
 	fi
@@ -409,7 +402,7 @@ cmd_remove() {
 	rm -rf "$app_dir"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
-	ok "✅ Removed $app_name"
+	log "✅ Removed $app_name"
 }
 
 cmd_internal_deploy-app() {
@@ -510,10 +503,10 @@ cmd_internal_sync() {
 				import logging "$app_dir"
 		}
 		CADDY
+		caddy fmt "$app_dir/caddy.conf" --overwrite
 	else
 		> "$app_dir/caddy.conf"
 	fi
-	caddy fmt "$app_dir/caddy.conf" --overwrite
 
 	if ! $is_static; then
 		local env_lines; env_lines=$(

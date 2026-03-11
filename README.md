@@ -18,12 +18,35 @@ On the other hand, deploy.sh is a single ~500 line shell script that you can rea
 
 [^nginx]: Why Caddy over something like nginx, which _is_ preinstalled on most Linux systems? nginx doesn't support automatic TLS certificate renewal out of the box. Since we'd need to install a package either way, we use Caddy for a more integrated web server.
 
+## Directory structure
+
+`deploy init` creates the following layout at `/srv/deploy`:
+
+```
+/srv/deploy/
+├── .internal/
+│   ├── machine/              # Alpine Linux base image
+│   ├── Caddyfile             # Global Caddy config (imports all app caddy.conf files)
+│   └── ports                 # Port assignments (app-name=port)
+└── <app-name>/
+    ├── repo.git/             # Bare git repo (push target)
+    ├── releases/
+    │   └── <YYYYMMDD-HHMMSS>/  # Checkout of each deploy (last 5 kept)
+    ├── current -> releases/<timestamp>  # Symlink to active release
+    ├── machine/              # Container filesystem (systemd-nspawn); only for containerized apps
+    ├── data/                 # Persistent data volume (mounted as /data inside container)
+    ├── caddy.conf            # Per-app Caddy config snippet
+    ├── server.conf           # Server-side config (domain, env, mounts)
+    ├── start.sh              # Container entrypoint (sets $PORT, runs start command)
+    └── access.log            # HTTP access log (JSON; written by Caddy)
+```
+
 ## Configuration
 
 App configuration is in two main files:
 
 - `deploy.conf` should be placed at the root of your repo, and contains instructions for deploying your app.
-- `server.conf` resides on the server at `/srv/deploy/apps/<name>/server.conf`, and contains sensitive server-specific information.
+- `server.conf` resides on the server at `/srv/deploy/<name>/server.conf`, and contains sensitive server-specific information.
 
 Both files use `key=value` syntax. Repeated keys are allowed. Lines beginning with `#` are comments.
 
@@ -55,15 +78,6 @@ build=npm ci && npm run build
 
 # optional: serve assets before proxying
 assets=public
-
-# For all apps (static sites and containers)
-# ------------------------------------------
-
-# optional: domain routing (multi-value)
-domain=example.com
-
-# can specify multiple domains
-domain=www.example.com
 ```
 
 The `start` command receives the port to bind to as the `PORT` environment variable.
@@ -73,6 +87,9 @@ Changes to deploy.conf take effect on next `git push`.
 ### server.conf
 
 ```conf
+# optional: domain routing
+domain=example.com
+
 # read-write mount
 mount=/data/uploads:/app/uploads
 
