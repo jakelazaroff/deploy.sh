@@ -395,13 +395,34 @@ cmd_restart() {
 	fi
 }
 
+cmd_rollback() {
+	require_arg "$1" "Usage: deploy rollback <app-name>"
+	require_root rollback "$@"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
+
+	local current_release; current_release=$(readlink "$app_dir/current" 2>/dev/null)
+	if [ -z "$current_release" ]; then die "No current release for $app_name"; fi
+
+	local target
+	target=$(ls -d "$app_dir/releases"/*/ 2>/dev/null | sed 's|/$||' | sort -r | grep -vF "$current_release" | head -1)
+	if [ -z "$target" ]; then die "No previous release to roll back to"; fi
+
+	log "⏪ Rolling back $app_name to $(basename "$target")..."
+	ln -sfn "$target" "$app_dir/current"
+	cmd_internal_sync "$app_name"
+}
+
 cmd_remove() {
-	require_arg "$1" "Usage: deploy remove <app-name>"
+	require_arg "$1" "Usage: deploy remove <app-name> [-y]"
+	local force=false; [[ "${2:-}" == "-y" ]] && force=true
 	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
-	read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
-	if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	if ! $force; then
+		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
+		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	fi
 	log "🗑️  Removing app: $app_name"
 	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
 		log "  Stopping service..."
@@ -427,11 +448,18 @@ cmd_internal_deploy-app() {
 	local current_link="$app_dir/current"
 
 	log "📦 Deploying $app_name..."
-	mkdir -p "$release_dir"
 	local repo_dir=$(pwd)
 	unset GIT_DIR
-	git --work-tree="$release_dir" --git-dir="$repo_dir" checkout HEAD -f
+	# Clone rather than checkout so that .git lives inside the release dir. This
+	# keeps all git metadata (gitdir pointers, core.worktree, submodule configs)
+	# self-relative to the release dir, which means they resolve correctly when
+	# the dir is mounted at /build inside the build container.
+	git clone --local --quiet "$repo_dir" "$release_dir"
 	cd "$release_dir"
+	if [ -f "$release_dir/.gitmodules" ]; then
+		log "📦 Initializing submodules..."
+		git -C "$release_dir" submodule update --init --recursive
+	fi
 
 	local deployfile="$release_dir/deploy.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
@@ -631,7 +659,8 @@ cmd_help() {
 	  deploy requests <name> [options...] Show HTTP access logs
 	  Options: -f, -n N, --since DATE, --before DATE, --no-pager
 	  deploy restart <name>               Restart an app
-	  deploy remove <name>                Remove an app
+	  deploy rollback <name>              Roll back to the previous release
+	  deploy remove <name> [-y]           Remove an app (-y to skip confirmation)
 	  deploy uninstall                    Remove all deploy.sh system changes
 
 	deploy.conf (in repo root):
@@ -666,6 +695,7 @@ case "${1:-help}" in
 	logs)            shift; cmd_logs "$@" ;;
 	requests)        shift; cmd_requests "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
+	rollback)        shift; cmd_rollback "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
 	uninstall)       cmd_uninstall ;;
 	_deploy-app)     shift; cmd_internal_deploy-app "$@" ;;
