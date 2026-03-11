@@ -132,12 +132,8 @@ cmd_init() {
 
 		(logging) {
 		    log {
-		        output file {args[0]}/access.json.log
-		        format json
-		    }
-		    log {
 		        output file {args[0]}/access.log
-		        format console
+		        format json
 		    }
 		}
 
@@ -288,46 +284,75 @@ cmd_info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
-cmd_logs() {
-	require_arg "$1" "Usage: deploy logs <app-name> [journalctl-options...]"
-	require_root logs "$@"
-	local app_name=$1; shift
-	journalctl --no-pager -u "deploy@$app_name" "$@"
-}
-
-cmd_requests() {
-	require_arg "$1" "Usage: deploy requests <app-name> [-f] [--since <date>] [--before <date>]"
-	require_root requests "$@"
-	local app_name=$1; shift
-	local log_file="$DEPLOY_ROOT/$app_name/access.log"
-	local follow=false since_ts="" before_ts=""
-
+parse_log_args() {
+	follow=false; num=""; since=""; before=""; no_pager=false
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			-f) follow=true ;;
-			--since) shift; since_ts=$(date -d "$1" +%s 2>/dev/null) || die "Invalid --since date: $1" ;;
-			--before) shift; before_ts=$(date -d "$1" +%s 2>/dev/null) || die "Invalid --before date: $1" ;;
+			-f)          follow=true ;;
+			-n)          shift; num=$1 ;;
+			--since)     shift; since=$1 ;;
+			--before)    shift; before=$1 ;;
+			--no-pager)  no_pager=true ;;
+			*)           die "Unknown option: $1" ;;
 		esac
 		shift
 	done
+}
+
+pager() { if ! $follow && ! $no_pager && [ -t 1 ]; then less -FRX; else cat; fi; }
+
+cmd_logs() {
+	require_arg "$1" "Usage: deploy logs <app-name> [-f] [-n N] [--since DATE] [--before DATE] [--no-pager]"
+	require_root logs "$@"
+	local app_name=$1; shift
+	local follow no_pager num since before
+	parse_log_args "$@"
+
+	local args=(--no-pager -u "deploy@$app_name")
+	$follow          && args+=(-f)
+	[ -n "$num" ]    && args+=(-n "$num")
+	[ -n "$since" ]  && args+=(--since "$since")
+	[ -n "$before" ] && args+=(--before "$before")
+
+	journalctl "${args[@]}" | pager
+}
+
+cmd_requests() {
+	require_arg "$1" "Usage: deploy requests <app-name> [-f] [-n N] [--since DATE] [--before DATE] [--no-pager]"
+	require_root requests "$@"
+	local app_name=$1; shift
+	local log_file="$DEPLOY_ROOT/$app_name/access.log"
+	local follow no_pager num since before
+	parse_log_args "$@"
 
 	if [ ! -f "$log_file" ]; then die "No access log found at $log_file"; fi
 
-	if [ -z "$since_ts" ] && [ -z "$before_ts" ]; then
-		if $follow; then tail -f "$log_file"; else cat "$log_file"; fi
-		return
-	fi
+	local since_ts="" before_ts=""
+	[ -n "$since" ]  && { since_ts=$(date -d "$since" +%s 2>/dev/null)  || die "Invalid --since date: $since"; }
+	[ -n "$before" ] && { before_ts=$(date -d "$before" +%s 2>/dev/null) || die "Invalid --before date: $before"; }
 
-	if $follow; then tail -f "$log_file"; else cat "$log_file"; fi \
-	| awk -v since="$since_ts" -v before="$before_ts" '
-		{
-			if (match($0, /"ts":[0-9]+/))
-				ts = substr($0, RSTART+5, RLENGTH-5) + 0
-			if (since  != "" && ts < since+0)  next
-			if (before != "" && ts > before+0) next
-			print
-		}
-	'
+	{
+		if $follow; then tail -f ${num:+-n "$num"} "$log_file"
+		else cat "$log_file"
+		fi \
+		| awk -v since="$since_ts" -v before="$before_ts" '
+			{
+				if (match($0, /"ts":[0-9.]+/))
+					ts = substr($0, RSTART+5, RLENGTH-5) + 0
+				if (since  != "" && ts < since+0)  next
+				if (before != "" && ts > before+0) next
+
+				method = uri = status = size = ms = "-"
+				if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
+				if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
+				if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
+				if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
+				if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
+				printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
+			}
+		' \
+		| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
+	} | pager
 }
 
 cmd_config() {
@@ -593,8 +618,9 @@ cmd_help() {
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
 	  deploy config <name> [--edit]        Show server.conf (--edit to open in $EDITOR, pipe to replace)
-	  deploy logs <name> [options...]     Show app logs (passes options to journalctl)
-	  deploy requests <name> [options...] Show HTTP access logs (-f, --since, --before)
+	  deploy logs <name> [options...]     Show app logs
+	  deploy requests <name> [options...] Show HTTP access logs
+	  Options: -f, -n N, --since DATE, --before DATE, --no-pager
 	  deploy restart <name>               Restart an app
 	  deploy remove <name>                Remove an app
 	  deploy uninstall                    Remove all deploy.sh system changes
