@@ -25,6 +25,8 @@ log() { echo "$@" >&2; }
 
 require_arg() { [ -n "$1" ] || die "$2"; }
 
+# Callers must pass the subcommand + its args: require_root <subcommand> "$@"
+# so that sudo re-invokes the script with the full command line.
 require_root() { if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi; }
 
 check_domain_collision() {
@@ -58,12 +60,15 @@ get_conf_all() {
 assign_port() {
 	local app_name=$1
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
-	if [ -n "$existing" ]; then echo "$existing"; return; fi
-	local port=49152
-	while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
-	echo "$app_name=$port" >> "$ports_file"
-	echo "$port"
+	(
+		flock -x 9
+		local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
+		if [ -n "$existing" ]; then echo "$existing"; exit 0; fi
+		local port=49152
+		while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
+		echo "$app_name=$port" >> "$ports_file"
+		echo "$port"
+	) 9>>"$ports_file.lock"
 }
 
 # SUBCOMMANDS
@@ -117,7 +122,17 @@ cmd_init() {
 		log "✅ Base image ready"
 	fi
 
-	command -v caddy &>/dev/null || { log "📦 Installing Caddy..."; curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy; chmod +x /usr/local/bin/caddy; }
+	if ! command -v caddy &>/dev/null; then
+		log "📦 Installing Caddy..."
+		local caddy_arch; case "$(uname -m)" in
+			x86_64)  caddy_arch=amd64 ;;
+			aarch64) caddy_arch=arm64 ;;
+			armv7l)  caddy_arch=armv7 ;;
+			*)       die "Unsupported architecture for Caddy: $(uname -m)" ;;
+		esac
+		curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=$caddy_arch" -o /usr/local/bin/caddy
+		chmod +x /usr/local/bin/caddy
+	fi
 
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
@@ -417,8 +432,6 @@ cmd_internal_deploy-app() {
 	unset GIT_DIR
 	git --work-tree="$release_dir" --git-dir="$repo_dir" checkout HEAD -f
 	cd "$release_dir"
-	ln -sfn "$release_dir" "$current_link"
-	log "✅ Deployed to $current_link"
 
 	local deployfile="$release_dir/deploy.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
@@ -452,6 +465,9 @@ cmd_internal_deploy-app() {
 			rm -rf "$build_dir"
 		fi
 	fi
+
+	ln -sfn "$release_dir" "$current_link"
+	log "✅ Deployed to $current_link"
 
 	cmd_internal_sync "$app_name"
 	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
