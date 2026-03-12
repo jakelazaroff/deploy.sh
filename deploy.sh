@@ -216,6 +216,7 @@ cmd_init() {
 	log "📝 Created deploy@.service template"
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
+	Defaults env_keep += "SSH_AUTH_SOCK"
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
 	ALL ALL=(deploy) NOPASSWD: /usr/local/bin/deploy *
 	SUDOERS
@@ -384,6 +385,72 @@ cmd_config() {
 	fi
 }
 
+_key_fingerprint() {
+	local tmpkey; tmpkey=$(mktemp)
+	echo "$1" > "$tmpkey"
+	ssh-keygen -lf "$tmpkey" 2>/dev/null | awk '{print $2}'
+	rm -f "$tmpkey"
+}
+
+cmd_keys() {
+	require_arg "$1" "Usage: deploy keys <app-name> [add|remove] [args...]"
+	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
+	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
+
+	case "${2:-list}" in
+		list)
+			local found=false
+			while IFS= read -r line; do
+				[[ "$line" != *" deploy:$app_name:"* ]] && continue
+				found=true
+				local raw_key="${line#*no-pty }"
+				local key_name="${raw_key##*deploy:$app_name:}"
+				printf "%-24s  %s\n" "$key_name" "$(_key_fingerprint "$raw_key")"
+			done < "$auth_keys"
+			$found || log "(no deploy keys for $app_name)"
+			;;
+		add)
+			require_arg "${3:-}" "Usage: deploy keys <app-name> add <key-name> [public-key]"
+			require_root keys "$@"
+			local key_name=$3 pubkey="${4:-}"
+			[ -z "$pubkey" ] && read -r pubkey
+			[ -z "$pubkey" ] && die "No public key provided"
+			# Normalize: replace the original comment with "deploy:<app>:<key-name>"
+			# so entries can be listed and removed by name.
+			local keytype keydata _rest
+			read -r keytype keydata _rest <<< "$pubkey"
+			local normalized="$keytype $keydata deploy:$app_name:$key_name"
+			local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
+			echo "$entry" >> "$auth_keys"
+			log "✅ Added deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")"
+			;;
+		remove)
+			require_arg "${3:-}" "Usage: deploy keys <app-name> remove <key-name>"
+			require_root keys "$@"
+			local key_name=$3
+			local tmpfile; tmpfile=$(mktemp)
+			local found=false
+			while IFS= read -r line; do
+				if [[ "$line" == *" deploy:$app_name:$key_name" ]]; then
+					found=true; continue
+				fi
+				echo "$line" >> "$tmpfile"
+			done < "$auth_keys"
+			if $found; then
+				mv "$tmpfile" "$auth_keys"
+				log "✅ Removed deploy key '$key_name' from $app_name"
+			else
+				rm -f "$tmpfile"
+				die "Key '$key_name' not found for $app_name"
+			fi
+			;;
+		*)
+			die "Usage: deploy keys <app-name> [add|remove] [args...]"
+			;;
+	esac
+}
+
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
 	require_root restart "$@"
@@ -458,7 +525,7 @@ cmd_internal_deploy-app() {
 	cd "$release_dir"
 	if [ -f "$release_dir/.gitmodules" ]; then
 		log "📦 Initializing submodules..."
-		git -C "$release_dir" submodule update --init --recursive
+		GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$release_dir" submodule update --init --recursive
 	fi
 
 	local deployfile="$release_dir/deploy.conf"
@@ -654,10 +721,13 @@ cmd_help() {
 	  deploy create <name>                Create a new app
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
-	  deploy config <name> [--edit]        Show server.conf (--edit to open in $EDITOR, pipe to replace)
+	  deploy config <name> [--edit]       Show server.conf (--edit to open in ${EDITOR:-${VISUAL:-vi}})
 	  deploy logs <name> [options...]     Show app logs
 	  deploy requests <name> [options...] Show HTTP access logs
 	  Options: -f, -n N, --since DATE, --before DATE, --no-pager
+	  deploy keys <name>                  List deploy keys for an app
+	  deploy keys <name> add <key> [pub]  Add a restricted deploy key
+	  deploy keys <name> remove <key>     Remove a deploy key by name
 	  deploy restart <name>               Restart an app
 	  deploy rollback <name>              Roll back to the previous release
 	  deploy remove <name> [-y]           Remove an app (-y to skip confirmation)
@@ -694,6 +764,7 @@ case "${1:-help}" in
 	config)          shift; cmd_config "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
 	requests)        shift; cmd_requests "$@" ;;
+	keys)            shift; cmd_keys "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
 	rollback)        shift; cmd_rollback "$@" ;;
 	remove)          shift; cmd_remove "$@" ;;
