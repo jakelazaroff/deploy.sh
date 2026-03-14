@@ -10,7 +10,7 @@
 
 # Install: curl -fsSL https://raw.githubusercontent.com/jakelazaroff/deploy.sh/refs/heads/main/deploy.sh -o /usr/local/bin/deploy && chmod +x /usr/local/bin/deploy
 
-set -e
+set -euo pipefail
 
 DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
@@ -243,7 +243,7 @@ cmd_init() {
 cmd_create() {
 	require_arg "$1" "Usage: deploy create <app-name>"
 	require_root create "$@"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
@@ -275,7 +275,7 @@ cmd_list() {
 
 cmd_info() {
 	require_arg "$1" "Usage: deploy info <app-name>"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local deployfile="$app_dir/current/deploy.conf"
@@ -328,6 +328,9 @@ cmd_info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
+# Sets variables in the caller's scope. Callers must declare:
+#   local follow no_pager num since before
+# before calling this function.
 parse_log_args() {
 	follow=false; num=""; since=""; before=""; no_pager=false
 	while [ $# -gt 0 ]; do
@@ -343,16 +346,9 @@ parse_log_args() {
 	done
 }
 
+# Uses $follow and $no_pager from the caller's scope (set by parse_log_args)
 pager() { if ! $follow && ! $no_pager && [ -t 1 ]; then less -FRX; else cat; fi; }
 
-# Output a plain log file to stdout using $follow, $num (set by parse_log_args)
-_stream_log_file() {
-	local log_file=$1
-	if [ ! -f "$log_file" ]; then die "No log found at $log_file"; fi
-	if $follow; then tail -f ${num:+-n "$num"} "$log_file"
-	else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
-	fi
-}
 
 cmd_logs() {
 	require_arg "$1" "Usage: deploy logs <app-name> [app|build|access] [options...]"
@@ -376,7 +372,11 @@ cmd_logs() {
 			journalctl "${args[@]}" | pager
 			;;
 		build)
-			_stream_log_file "$DEPLOY_ROOT/$app_name/build.log" | pager
+			local log_file="$DEPLOY_ROOT/$app_name/build.log"
+			if [ ! -f "$log_file" ]; then die "No build log found for $app_name"; fi
+			{ if $follow; then tail -f ${num:+-n "$num"} "$log_file"
+			  else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
+			  fi } | pager
 			;;
 		access)
 			local log_file="$DEPLOY_ROOT/$app_name/access.log"
@@ -412,7 +412,7 @@ cmd_logs() {
 
 cmd_config() {
 	require_arg "$1" "Usage: deploy config <app-name>"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$1"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root config "$@"
 	local app_conf="$app_dir/server.conf"
@@ -428,15 +428,12 @@ cmd_config() {
 }
 
 _key_fingerprint() {
-	local tmpkey; tmpkey=$(mktemp)
-	echo "$1" > "$tmpkey"
-	ssh-keygen -lf "$tmpkey" 2>/dev/null | awk '{print $2}'
-	rm -f "$tmpkey"
+	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
 }
 
 cmd_keys() {
 	require_arg "$1" "Usage: deploy keys <app-name> [add|remove] [args...]"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 
@@ -507,25 +504,29 @@ cmd_restart() {
 cmd_rollback() {
 	require_arg "$1" "Usage: deploy rollback <app-name>"
 	require_root rollback "$@"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local current_release; current_release=$(readlink "$app_dir/current" 2>/dev/null)
 	if [ -z "$current_release" ]; then die "No current release for $app_name"; fi
 
-	local target
-	target=$(ls -d "$app_dir/releases"/*/ 2>/dev/null | sed 's|/$||' | sort -r | grep -vF "$current_release" | head -1)
+	local target=""
+	for dir in "$app_dir/releases"/*/; do
+		dir="${dir%/}"
+		[[ "$dir" == */"$(basename "$current_release")" ]] && continue
+		[[ "$dir" > "$target" ]] && target="$dir"
+	done
 	if [ -z "$target" ]; then die "No previous release to roll back to"; fi
 
-	log "⏪ Rolling back $app_name to $(basename "$target")..."
+	log "⏪ Rolling back $app_name from $(basename "$current_release") to $(basename "$target")..."
 	ln -sfn "releases/$(basename "$target")" "$app_dir/current"
 	cmd_internal_sync "$app_name"
 }
 
 cmd_remove() {
-	require_arg "$1" "Usage: deploy remove <app-name> [-y]"
-	local force=false; [[ "${2:-}" == "-y" ]] && force=true
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	require_arg "$1" "Usage: deploy remove <app-name> [-f]"
+	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	require_root remove "$@"
 	if ! $force; then
@@ -539,20 +540,18 @@ cmd_remove() {
 	fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
-	if [ -f "$app_dir/caddy.conf" ]; then
-		log "  Removing from Caddy..."
-		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
-	fi
-	log "  Removing app files..."
-	rm -rf "$app_dir"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
+	log "  Removing app files..."
+	rm -rf "$app_dir"
+	log "  Reloading Caddy..."
+	caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	log "✅ Removed $app_name"
 }
 
 cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
 
@@ -601,7 +600,6 @@ cmd_internal_deploy-app() {
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
 		log "🔧 Running build..."
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd" 2>&1 | tee "$build_log"
-		[ "${PIPESTATUS[0]}" -eq 0 ]
 		if [ -n "$start_cmd" ]; then
 			systemctl stop "deploy@$app_name" 2>/dev/null || true
 			rm -rf "$app_dir/machine"
@@ -612,11 +610,10 @@ cmd_internal_deploy-app() {
 	fi
 
 	ln -sfn "releases/$(basename "$release_dir")" "$current_link"
-	log "✅ Deployed to $current_link"
-
 	cmd_internal_sync "$app_name"
 	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
 	log "🧹 Cleaned up old releases"
+	log "✅ Deployed to $current_link"
 
 	trap - EXIT
 	local finish_time; finish_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -626,7 +623,7 @@ cmd_internal_deploy-app() {
 
 cmd_internal_sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
@@ -724,7 +721,12 @@ cmd_internal_sync() {
 	fi
 
 	if [ -n "$domain" ]; then caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
-	if ! $is_static; then
+	if $is_static; then
+		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
+			systemctl stop "deploy@$app_name"
+			systemctl disable "deploy@$app_name"
+		fi
+	else
 		systemctl daemon-reload
 		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
 		systemctl restart "deploy@$app_name"
@@ -756,11 +758,6 @@ cmd_uninstall() {
 	rm -f /etc/sudoers.d/deploy
 	systemctl daemon-reload
 
-	if [ -f /etc/nsswitch.conf.backup ]; then
-		mv /etc/nsswitch.conf.backup /etc/nsswitch.conf
-		log "  Restored /etc/nsswitch.conf"
-	fi
-
 	rm -rf "$DEPLOY_ROOT"
 	if id "$DEPLOY_USER" &>/dev/null; then userdel -r "$DEPLOY_USER"; fi
 
@@ -786,7 +783,7 @@ cmd_help() {
 	  deploy keys <name> remove <key>     Remove a deploy key by name
 	  deploy restart <name>               Restart an app
 	  deploy rollback <name>              Roll back to the previous release
-	  deploy remove <name> [-y]           Remove an app (-y to skip confirmation)
+	  deploy remove <name> [-f]           Remove an app (-f to skip confirmation)
 	  deploy uninstall                    Remove all deploy.sh system changes
 
 	deploy.conf (in repo root):
