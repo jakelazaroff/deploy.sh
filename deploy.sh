@@ -190,7 +190,7 @@ cmd_init() {
 		log "📝 Created Caddyfile"
 	fi
 
-	cat > "$DEPLOY_ROOT/.internal/caddy.service" <<-SERVICE
+	cat > /etc/systemd/system/caddy.service <<-SERVICE
 	[Unit]
 	Description=Caddy
 	After=network.target
@@ -206,7 +206,7 @@ cmd_init() {
 	WantedBy=multi-user.target
 	SERVICE
 
-	systemctl enable "$DEPLOY_ROOT/.internal/caddy.service" && systemctl start caddy
+	systemctl daemon-reload && systemctl enable caddy && systemctl start caddy
 
 	cat > "$DEPLOY_ROOT/.internal/deploy@.service" <<-SERVICE
 	[Unit]
@@ -222,7 +222,7 @@ cmd_init() {
 	[Install]
 	WantedBy=multi-user.target
 	SERVICE
-	systemctl link "$DEPLOY_ROOT/.internal/deploy@.service"
+	systemctl enable "$DEPLOY_ROOT/.internal/deploy@.service"
 	log "📝 Created deploy@.service template"
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
@@ -750,9 +750,9 @@ cmd_uninstall() {
 	done
 	if systemctl is-active --quiet caddy 2>/dev/null; then log "  Stopping caddy..."; systemctl stop caddy; fi
 	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
-	rm -f /usr/local/bin/caddy
+	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
 
-	rm -f /etc/systemd/system/deploy@.service
+	systemctl disable deploy@.service 2>/dev/null || true
 	rm -f /etc/sudoers.d/deploy
 	systemctl daemon-reload
 

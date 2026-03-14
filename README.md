@@ -26,6 +26,8 @@ On the other hand, deploy.sh is a single ~500 line shell script that you can rea
 /srv/deploy/
 ├── .internal/
 │   ├── machine/              # Alpine Linux base image
+│   ├── caddy.service         # Caddy systemd unit (linked into /etc/systemd/system/)
+│   ├── deploy@.service       # Container systemd template (linked into /etc/systemd/system/)
 │   ├── Caddyfile             # Global Caddy config (imports all app caddy.conf files)
 │   └── ports                 # Port assignments (app-name=port)
 └── <app-name>/
@@ -35,6 +37,7 @@ On the other hand, deploy.sh is a single ~500 line shell script that you can rea
     ├── current -> releases/<timestamp>  # Symlink to active release
     ├── machine/              # Container filesystem (systemd-nspawn); only for containerized apps
     ├── data/                 # Persistent data volume (mounted as /data inside container)
+    ├── deploy-<app-name>.nspawn  # systemd-nspawn container settings
     ├── caddy.conf            # Per-app Caddy config snippet
     ├── server.conf           # Server-side config (domain, env, mounts)
     ├── start.sh              # Container entrypoint (sets $PORT, runs start command)
