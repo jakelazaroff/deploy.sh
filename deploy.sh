@@ -25,6 +25,16 @@ log() { echo "$@" >&2; }
 
 require_arg() { [ -n "$1" ] || die "$2"; }
 
+# Global state for deploy status tracking
+_DEPLOY_STATUS_FILE=""
+_DEPLOY_START_TIME=""
+_deploy_exit_trap() {
+	local code=$?
+	[ -z "$_DEPLOY_STATUS_FILE" ] && return
+	local finish; finish=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+	printf 'status=failed\nstarted=%s\nfinished=%s\n' "$_DEPLOY_START_TIME" "$finish" > "$_DEPLOY_STATUS_FILE"
+}
+
 # Callers must pass the subcommand + its args: require_root <subcommand> "$@"
 # so that sudo re-invokes the script with the full command line.
 require_root() { if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi; }
@@ -283,8 +293,29 @@ cmd_info() {
 	fi
 	domain=$(get_conf "$app_conf" "domain")
 
+	local status_file="$app_dir/deploy.status"
+	local deploy_status="" deploy_started="" deploy_finished="" deploy_pid=""
+	if [ -f "$status_file" ]; then
+		deploy_status=$(get_conf "$status_file" "status")
+		deploy_started=$(get_conf "$status_file" "started")
+		deploy_finished=$(get_conf "$status_file" "finished")
+		deploy_pid=$(get_conf "$status_file" "pid")
+		if [ "$deploy_status" = "running" ] && [ -n "$deploy_pid" ] && ! kill -0 "$deploy_pid" 2>/dev/null; then
+			deploy_status="interrupted"
+		fi
+	fi
+
 	echo -e "\e[1m$app_name\e[0m"
 	[ -n "$deployed_at" ] && echo "┆ Last deployed: $deployed_at"
+	if [ -n "$deploy_status" ]; then
+		local deploy_time=""
+		if [ "$deploy_status" = "running" ] && [ -n "$deploy_started" ]; then
+			deploy_time=" (since ${deploy_started:0:10} ${deploy_started:11:5})"
+		elif [ -n "$deploy_finished" ]; then
+			deploy_time=" (${deploy_finished:0:10} ${deploy_finished:11:5})"
+		fi
+		echo "┆ Deploy:  $deploy_status$deploy_time"
+	fi
 	if [ ! -f "$deployfile" ]; then echo "┆ Not yet deployed"; return; fi
 	if [ -n "$start_cmd" ]; then
 		echo "┆ Type:    container ($status)"
@@ -314,58 +345,69 @@ parse_log_args() {
 
 pager() { if ! $follow && ! $no_pager && [ -t 1 ]; then less -FRX; else cat; fi; }
 
-cmd_logs() {
-	require_arg "$1" "Usage: deploy logs <app-name> [-f] [-n N] [--since DATE] [--before DATE] [--no-pager]"
-	require_root logs "$@"
-	local app_name=$1; shift
-	local follow no_pager num since before
-	parse_log_args "$@"
-
-	local args=(--no-pager -u "deploy@$app_name")
-	$follow          && args+=(-f)
-	[ -n "$num" ]    && args+=(-n "$num")
-	[ -n "$since" ]  && args+=(--since "$since")
-	[ -n "$before" ] && args+=(--before "$before")
-
-	journalctl "${args[@]}" | pager
+# Output a plain log file to stdout using $follow, $num (set by parse_log_args)
+_stream_log_file() {
+	local log_file=$1
+	if [ ! -f "$log_file" ]; then die "No log found at $log_file"; fi
+	if $follow; then tail -f ${num:+-n "$num"} "$log_file"
+	else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
+	fi
 }
 
-cmd_requests() {
-	require_arg "$1" "Usage: deploy requests <app-name> [-f] [-n N] [--since DATE] [--before DATE] [--no-pager]"
-	require_root requests "$@"
+cmd_logs() {
+	require_arg "$1" "Usage: deploy logs <app-name> [app|build|access] [options...]"
+	require_root logs "$@"
 	local app_name=$1; shift
-	local log_file="$DEPLOY_ROOT/$app_name/access.log"
+	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
+
+	local stream="app"
+	case "${1:-}" in app|build|access) stream=$1; shift ;; esac
+
 	local follow no_pager num since before
 	parse_log_args "$@"
 
-	if [ ! -f "$log_file" ]; then die "No access log found at $log_file"; fi
-
-	local since_ts="" before_ts=""
-	[ -n "$since" ]  && { since_ts=$(date -d "$since" +%s 2>/dev/null)  || die "Invalid --since date: $since"; }
-	[ -n "$before" ] && { before_ts=$(date -d "$before" +%s 2>/dev/null) || die "Invalid --before date: $before"; }
-
-	{
-		if $follow; then tail -f ${num:+-n "$num"} "$log_file"
-		else cat "$log_file"
-		fi \
-		| awk -v since="$since_ts" -v before="$before_ts" '
+	case "$stream" in
+		app)
+			local args=(--no-pager -u "deploy@$app_name")
+			$follow          && args+=(-f)
+			[ -n "$num" ]    && args+=(-n "$num")
+			[ -n "$since" ]  && args+=(--since "$since")
+			[ -n "$before" ] && args+=(--before "$before")
+			journalctl "${args[@]}" | pager
+			;;
+		build)
+			_stream_log_file "$DEPLOY_ROOT/$app_name/build.log" | pager
+			;;
+		access)
+			local log_file="$DEPLOY_ROOT/$app_name/access.log"
+			if [ ! -f "$log_file" ]; then die "No access log found for $app_name"; fi
+			local since_ts="" before_ts=""
+			[ -n "$since" ]  && { since_ts=$(date -d "$since" +%s 2>/dev/null)  || die "Invalid --since date: $since"; }
+			[ -n "$before" ] && { before_ts=$(date -d "$before" +%s 2>/dev/null) || die "Invalid --before date: $before"; }
 			{
-				if (match($0, /"ts":[0-9.]+/))
-					ts = substr($0, RSTART+5, RLENGTH-5) + 0
-				if (since  != "" && ts < since+0)  next
-				if (before != "" && ts > before+0) next
+				if $follow; then tail -f ${num:+-n "$num"} "$log_file"
+				else cat "$log_file"
+				fi \
+				| awk -v since="$since_ts" -v before="$before_ts" '
+					{
+						if (match($0, /"ts":[0-9.]+/))
+							ts = substr($0, RSTART+5, RLENGTH-5) + 0
+						if (since  != "" && ts < since+0)  next
+						if (before != "" && ts > before+0) next
 
-				method = uri = status = size = ms = "-"
-				if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
-				if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
-				if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
-				if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
-				if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
-				printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
-			}
-		' \
-		| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
-	} | pager
+						method = uri = status = size = ms = "-"
+						if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
+						if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
+						if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
+						if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
+						if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
+						printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
+					}
+				' \
+				| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
+			} | pager
+			;;
+	esac
 }
 
 cmd_config() {
@@ -476,7 +518,7 @@ cmd_rollback() {
 	if [ -z "$target" ]; then die "No previous release to roll back to"; fi
 
 	log "⏪ Rolling back $app_name to $(basename "$target")..."
-	ln -sfn "$target" "$app_dir/current"
+	ln -sfn "releases/$(basename "$target")" "$app_dir/current"
 	cmd_internal_sync "$app_name"
 }
 
@@ -513,6 +555,13 @@ cmd_internal_deploy-app() {
 	local app_name=$1; app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
 	local current_link="$app_dir/current"
+
+	local status_file="$app_dir/deploy.status"
+	local build_log="$app_dir/build.log"
+	local start_time; start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+	printf 'status=running\nstarted=%s\npid=%s\n' "$start_time" "$$" > "$status_file"
+	_DEPLOY_STATUS_FILE="$status_file"; _DEPLOY_START_TIME="$start_time"
+	trap '_deploy_exit_trap' EXIT
 
 	log "📦 Deploying $app_name..."
 	local repo_dir=$(pwd)
@@ -551,7 +600,8 @@ cmd_internal_deploy-app() {
 		rm -rf "$build_dir"
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
 		log "🔧 Running build..."
-		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd"
+		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd" 2>&1 | tee "$build_log"
+		[ "${PIPESTATUS[0]}" -eq 0 ]
 		if [ -n "$start_cmd" ]; then
 			systemctl stop "deploy@$app_name" 2>/dev/null || true
 			rm -rf "$app_dir/machine"
@@ -561,12 +611,17 @@ cmd_internal_deploy-app() {
 		fi
 	fi
 
-	ln -sfn "$release_dir" "$current_link"
+	ln -sfn "releases/$(basename "$release_dir")" "$current_link"
 	log "✅ Deployed to $current_link"
 
 	cmd_internal_sync "$app_name"
 	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
 	log "🧹 Cleaned up old releases"
+
+	trap - EXIT
+	local finish_time; finish_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+	printf 'status=success\nstarted=%s\nfinished=%s\n' "$start_time" "$finish_time" > "$status_file"
+	_DEPLOY_STATUS_FILE=""
 }
 
 cmd_internal_sync() {
@@ -722,9 +777,10 @@ cmd_help() {
 	  deploy list                         List all apps
 	  deploy info <name>                  Show app info
 	  deploy config <name> [--edit]       Show server.conf (--edit to open in ${EDITOR:-${VISUAL:-vi}})
-	  deploy logs <name> [options...]     Show app logs
-	  deploy requests <name> [options...] Show HTTP access logs
-	  Options: -f, -n N, --since DATE, --before DATE, --no-pager
+	  deploy logs <name> [app|build|access] [options...]
+	  Show app logs (default), build output, or HTTP access logs
+	  Options: -f, -n N, --no-pager
+	  app/access also support: --since DATE, --before DATE
 	  deploy keys <name>                  List deploy keys for an app
 	  deploy keys <name> add <key> [pub]  Add a restricted deploy key
 	  deploy keys <name> remove <key>     Remove a deploy key by name
@@ -763,7 +819,6 @@ case "${1:-help}" in
 	info)            shift; cmd_info "$@" ;;
 	config)          shift; cmd_config "$@" ;;
 	logs)            shift; cmd_logs "$@" ;;
-	requests)        shift; cmd_requests "$@" ;;
 	keys)            shift; cmd_keys "$@" ;;
 	restart)         shift; cmd_restart "$@" ;;
 	rollback)        shift; cmd_rollback "$@" ;;
