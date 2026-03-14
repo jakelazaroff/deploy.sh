@@ -190,7 +190,7 @@ cmd_init() {
 		log "📝 Created Caddyfile"
 	fi
 
-	cat > /etc/systemd/system/caddy.service <<-SERVICE
+	cat > "$DEPLOY_ROOT/.internal/caddy.service" <<-SERVICE
 	[Unit]
 	Description=Caddy
 	After=network.target
@@ -206,10 +206,9 @@ cmd_init() {
 	WantedBy=multi-user.target
 	SERVICE
 
-	systemctl daemon-reload && systemctl enable caddy && systemctl start caddy
+	systemctl enable "$DEPLOY_ROOT/.internal/caddy.service" && systemctl start caddy
 
-	mkdir -p /etc/systemd/nspawn
-	cat > /etc/systemd/system/deploy@.service <<-SERVICE
+	cat > "$DEPLOY_ROOT/.internal/deploy@.service" <<-SERVICE
 	[Unit]
 	Description=%i container
 	After=network.target
@@ -223,6 +222,7 @@ cmd_init() {
 	[Install]
 	WantedBy=multi-user.target
 	SERVICE
+	systemctl link "$DEPLOY_ROOT/.internal/deploy@.service"
 	log "📝 Created deploy@.service template"
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
@@ -539,7 +539,7 @@ cmd_remove() {
 		systemctl stop "deploy@$app_name"
 	fi
 	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
-	if [ -f "/etc/systemd/nspawn/deploy-$app_name.nspawn" ]; then rm "/etc/systemd/nspawn/deploy-$app_name.nspawn"; systemctl daemon-reload; fi
+	systemctl daemon-reload
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
 	log "  Removing app files..."
@@ -693,7 +693,7 @@ cmd_internal_sync() {
 		)
 
 		mkdir -p "$app_dir/data"
-		local nspawn_file="/etc/systemd/nspawn/deploy-$app_name.nspawn"
+		local nspawn_file="$app_dir/deploy-$app_name.nspawn"
 		cat > "$nspawn_file" <<-NSPAWN
 		[Exec]
 		Boot=no
@@ -748,11 +748,9 @@ cmd_uninstall() {
 		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then log "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
 		if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
 	done
-	rm -f /etc/systemd/nspawn/deploy-*.nspawn
-
 	if systemctl is-active --quiet caddy 2>/dev/null; then log "  Stopping caddy..."; systemctl stop caddy; fi
 	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
-	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
+	rm -f /usr/local/bin/caddy
 
 	rm -f /etc/systemd/system/deploy@.service
 	rm -f /etc/sudoers.d/deploy
