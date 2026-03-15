@@ -68,17 +68,72 @@ get_conf_all() {
 }
 
 assign_port() {
-	local app_name=$1
+	local app_name=$1 release_id=${2:-}
+	local key="$app_name"
+	[ -n "$release_id" ] && key="${app_name}--${release_id}"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	(
 		flock -x 9
-		local existing; existing=$(grep "^$app_name=" "$ports_file" 2>/dev/null | cut -d= -f2)
+		local existing; existing=$(grep "^$key=" "$ports_file" 2>/dev/null | cut -d= -f2)
 		if [ -n "$existing" ]; then echo "$existing"; exit 0; fi
 		local port=49152
 		while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
-		echo "$app_name=$port" >> "$ports_file"
+		echo "$key=$port" >> "$ports_file"
 		echo "$port"
 	) 9>>"$ports_file.lock"
+}
+
+get_active_release() {
+	local target
+	target=$(readlink "$DEPLOY_ROOT/$1/current" 2>/dev/null) || return 1
+	basename "$target"
+}
+
+wait_for_port() {
+	local port=$1 i=60
+	while ! (echo >/dev/tcp/localhost/"$port") 2>/dev/null; do
+		sleep 0.5; ((i--)) || return 1
+	done
+}
+
+activate_release() {
+	local app_name=$1 release_id=$2
+	local app_dir="$DEPLOY_ROOT/$app_name"
+	local release_dir="$app_dir/releases/$release_id"
+	local svc="deploy-${app_name}--${release_id}"
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+
+	local old_release; old_release=$(get_active_release "$app_name") || true
+	local start_cmd; start_cmd=$(get_conf "$release_dir/deploy.conf" "start")
+
+	if [ -n "$start_cmd" ]; then
+		# Container app: zero-downtime activation
+		systemctl link "$release_dir/${svc}.service"
+		systemctl daemon-reload
+		systemctl start "$svc"
+
+		local port; port=$(assign_port "$app_name" "$release_id")
+		if ! wait_for_port "$port"; then
+			systemctl stop "$svc" 2>/dev/null || true
+			systemctl disable "$svc" 2>/dev/null || true
+			sed -i "/^${app_name}--${release_id}=/d" "$ports_file"
+			die "New instance failed to start on port $port after 30s"
+		fi
+
+		ln -sfn "releases/$release_id" "$app_dir/current"
+		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
+
+		# Teardown old
+		if [ -n "$old_release" ] && [ "$old_release" != "$release_id" ]; then
+			systemctl stop "deploy-${app_name}--${old_release}" 2>/dev/null || true
+			systemctl disable "deploy-${app_name}--${old_release}" 2>/dev/null || true
+			sed -i "/^${app_name}--${old_release}=/d" "$ports_file"
+		fi
+	else
+		# Static app: atomic symlink swap
+		ln -sfn "releases/$release_id" "$app_dir/current"
+		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
+	fi
 }
 
 # SUBCOMMANDS
@@ -190,7 +245,7 @@ cmd_init() {
 		log "📝 Created Caddyfile"
 	fi
 
-	cat > /etc/systemd/system/caddy.service <<-SERVICE
+	cat > "$DEPLOY_ROOT/.internal/caddy.service" <<-SERVICE
 	[Unit]
 	Description=Caddy
 	After=network.target
@@ -206,24 +261,7 @@ cmd_init() {
 	WantedBy=multi-user.target
 	SERVICE
 
-	systemctl daemon-reload && systemctl enable caddy && systemctl start caddy
-
-	cat > "$DEPLOY_ROOT/.internal/deploy@.service" <<-SERVICE
-	[Unit]
-	Description=%i container
-	After=network.target
-
-	[Service]
-	Type=notify
-	ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override -D $DEPLOY_ROOT/%i/machine --machine=deploy-%i /app/start.sh
-	Restart=always
-	KillMode=mixed
-
-	[Install]
-	WantedBy=multi-user.target
-	SERVICE
-	systemctl enable "$DEPLOY_ROOT/.internal/deploy@.service"
-	log "📝 Created deploy@.service template"
+	systemctl enable "$DEPLOY_ROOT/.internal/caddy.service" && systemctl start caddy
 
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	Defaults env_keep += "SSH_AUTH_SOCK"
@@ -287,7 +325,9 @@ cmd_info() {
 	local start_cmd="" status="" domain="" assets="" spa=""
 	if [ -f "$deployfile" ]; then
 		start_cmd=$(get_conf "$deployfile" "start")
-		[ -n "$start_cmd" ] && status=$(systemctl is-active "deploy@$app_name" 2>/dev/null || true)
+		if [ -n "$start_cmd" ] && [ -n "$release_name" ]; then
+			status=$(systemctl is-active "deploy-${app_name}--${release_name}" 2>/dev/null || true)
+		fi
 		assets=$(get_conf "$deployfile" "assets")
 		spa=$(get_conf "$deployfile" "spa")
 	fi
@@ -364,7 +404,8 @@ cmd_logs() {
 
 	case "$stream" in
 		app)
-			local args=(--no-pager -u "deploy@$app_name")
+			local release_id; release_id=$(get_active_release "$app_name") || die "No active release"
+			local args=(--no-pager -u "deploy-${app_name}--${release_id}")
 			$follow          && args+=(-f)
 			[ -n "$num" ]    && args+=(-n "$num")
 			[ -n "$since" ]  && args+=(--since "$since")
@@ -420,7 +461,22 @@ cmd_config() {
 	if [ "${2:-}" = "--edit" ]; then
 		touch "$app_conf"
 		${EDITOR:-${VISUAL:-vi}} "$app_conf"
-		cmd_internal_sync "$app_name"
+
+		local old_release; old_release=$(get_active_release "$app_name") || die "Not yet deployed"
+		local old_dir="$app_dir/releases/$old_release"
+		local new_release; new_release=$(date +%Y%m%d-%H%M%S)
+		local new_dir="$app_dir/releases/$new_release"
+
+		# Copy release dir: hard-link git tree, real copy machine dir
+		cp -al "$old_dir" "$new_dir"
+		if [ -d "$new_dir/machine" ]; then
+			rm -rf "$new_dir/machine"
+			cp -a "$old_dir/machine" "$new_dir/machine"
+		fi
+		rm -f "$new_dir"/deploy-*.nspawn "$new_dir"/deploy-*.service "$new_dir/start.sh"
+
+		cmd_internal_sync "$app_name" "$new_release"
+		activate_release "$app_name" "$new_release"
 		log "Configuration updated"
 	else
 		if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
@@ -493,8 +549,9 @@ cmd_keys() {
 cmd_restart() {
 	require_arg "$1" "Usage: deploy restart <app-name>"
 	require_root restart "$@"
+	local release_id; release_id=$(get_active_release "$1") || die "No active release"
 	log "🔄 Restarting $1..."
-	if systemctl restart "deploy@$1"; then
+	if systemctl restart "deploy-${1}--${release_id}"; then
 		log "✅ Restarted"
 	else
 		die "Failed to restart $1"
@@ -519,8 +576,18 @@ cmd_rollback() {
 	if [ -z "$target" ]; then die "No previous release to roll back to"; fi
 
 	log "⏪ Rolling back $app_name from $(basename "$current_release") to $(basename "$target")..."
-	ln -sfn "releases/$(basename "$target")" "$app_dir/current"
-	cmd_internal_sync "$app_name"
+
+	local new_release; new_release=$(date +%Y%m%d-%H%M%S)
+	local new_dir="$app_dir/releases/$new_release"
+	cp -al "$target" "$new_dir"
+	if [ -d "$new_dir/machine" ]; then
+		rm -rf "$new_dir/machine"
+		cp -a "$target/machine" "$new_dir/machine"
+	fi
+	rm -f "$new_dir"/deploy-*.nspawn "$new_dir"/deploy-*.service "$new_dir/start.sh"
+
+	cmd_internal_sync "$app_name" "$new_release"
+	activate_release "$app_name" "$new_release"
 }
 
 cmd_remove() {
@@ -534,14 +601,15 @@ cmd_remove() {
 		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 	fi
 	log "🗑️  Removing app: $app_name"
-	if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
-		log "  Stopping service..."
-		systemctl stop "deploy@$app_name"
-	fi
-	if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
+	for dir in "$app_dir/releases"/*/; do
+		[ -d "$dir" ] || continue
+		local rid; rid=$(basename "$dir")
+		systemctl stop "deploy-${app_name}--${rid}" 2>/dev/null || true
+		systemctl disable "deploy-${app_name}--${rid}" 2>/dev/null || true
+	done
 	systemctl daemon-reload
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	if [ -f "$ports_file" ]; then sed -i "/^$app_name=/d" "$ports_file"; fi
+	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
 	log "  Removing app files..."
 	rm -rf "$app_dir"
 	log "  Reloading Caddy..."
@@ -552,8 +620,8 @@ cmd_remove() {
 cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	local release_dir="$app_dir/releases/$(date +%Y%m%d-%H%M%S)"
-	local current_link="$app_dir/current"
+	local release_id; release_id=$(date +%Y%m%d-%H%M%S)
+	local release_dir="$app_dir/releases/$release_id"
 
 	local status_file="$app_dir/deploy.status"
 	local build_log="$app_dir/build.log"
@@ -580,13 +648,9 @@ cmd_internal_deploy-app() {
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local build_cmd=$(get_conf "$deployfile" "build")
 
-	if [ -n "$start_cmd" ] && [ ! -d "$app_dir/machine" ]; then
-		log "🏗️  First deploy detected - cloning base image..."
-		cp -a "$DEPLOY_ROOT/.internal/machine" "$app_dir/machine"
-		rm -f "$app_dir/machine/etc/machine-id"
-		systemd-machine-id-setup --root="$app_dir/machine"
-		log "✅ Container created"
-	fi
+	# For container apps, set up the machine dir inside the release
+	local needs_machine=false
+	if [ -n "$start_cmd" ]; then needs_machine=true; fi
 
 	local app_conf="$app_dir/server.conf"
 	local setenv_args=()
@@ -600,20 +664,36 @@ cmd_internal_deploy-app() {
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
 		log "🔧 Running build..."
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd" 2>&1 | tee "$build_log"
-		if [ -n "$start_cmd" ]; then
-			systemctl stop "deploy@$app_name" 2>/dev/null || true
-			rm -rf "$app_dir/machine"
-			mv "$build_dir" "$app_dir/machine"
+		if $needs_machine; then
+			mv "$build_dir" "$release_dir/machine"
 		else
 			rm -rf "$build_dir"
 		fi
+	elif $needs_machine; then
+		# First container deploy or non-build container: clone base image
+		log "🏗️  Cloning base image..."
+		cp -a "$DEPLOY_ROOT/.internal/machine" "$release_dir/machine"
 	fi
 
-	ln -sfn "releases/$(basename "$release_dir")" "$current_link"
-	cmd_internal_sync "$app_name"
-	cd "$app_dir/releases" && ls -t | tail -n +6 | xargs -r rm -rf
+	if $needs_machine; then
+		rm -f "$release_dir/machine/etc/machine-id"
+		systemd-machine-id-setup --root="$release_dir/machine"
+	fi
+
+	cmd_internal_sync "$app_name" "$release_id"
+	activate_release "$app_name" "$release_id"
+
+	# Prune old releases
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+	cd "$app_dir/releases" && ls -t | tail -n +6 | while read -r old; do
+		systemctl stop "deploy-${app_name}--${old}" 2>/dev/null || true
+		systemctl disable "deploy-${app_name}--${old}" 2>/dev/null || true
+		sed -i "/^${app_name}--${old}=/d" "$ports_file"
+		rm -rf "$old"
+	done
+	systemctl daemon-reload
 	log "🧹 Cleaned up old releases"
-	log "✅ Deployed to $current_link"
+	log "✅ Deployed $app_name ($release_id)"
 
 	trap - EXIT
 	local finish_time; finish_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -623,13 +703,15 @@ cmd_internal_deploy-app() {
 
 cmd_internal_sync() {
 	require_arg "$1" "Internal error: app name required"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	local deployfile="$app_dir/current/deploy.conf" app_conf="$app_dir/server.conf"
+	require_arg "${2:-}" "Internal error: release id required"
+	local app_name=$1 release_id=$2; local app_dir="$DEPLOY_ROOT/$app_name"
+	local release_dir="$app_dir/releases/$release_id"
+	local deployfile="$release_dir/deploy.conf" app_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deployfile" "start")
 	local is_static=false; if [ -z "$start_cmd" ]; then is_static=true; fi
 	local domain; domain=$(get_conf "$app_conf" "domain")
 	if [ -n "$domain" ]; then check_domain_collision "$domain" "$app_name"; fi
-	local port; port=$(assign_port "$app_name")
+	local port; port=$(assign_port "$app_name" "$release_id")
 
 	log "🔄 Syncing configuration for $app_name..."
 
@@ -672,6 +754,8 @@ cmd_internal_sync() {
 	fi
 
 	if ! $is_static; then
+		local svc="deploy-${app_name}--${release_id}"
+
 		local env_lines; env_lines=$(
 			while IFS= read -r env_var; do
 				printf 'Environment="%s"\n' "$env_var"
@@ -693,17 +777,17 @@ cmd_internal_sync() {
 		)
 
 		mkdir -p "$app_dir/data"
-		local nspawn_file="$app_dir/deploy-$app_name.nspawn"
-		cat > "$nspawn_file" <<-NSPAWN
+		cat > "$release_dir/${svc}.nspawn" <<-NSPAWN
 		[Exec]
 		Boot=no
 		Parameters=/app/start.sh
+		Environment=PORT=$port
 		$env_lines
 
 		[Files]
-		Bind=$app_dir/current:/app
+		Bind=$release_dir:/app
 		Bind=$app_dir/data:/data
-		BindReadOnly=$app_dir/start.sh:/app/start.sh
+		BindReadOnly=$release_dir/start.sh:/app/start.sh
 		BindReadOnly=/etc/resolv.conf
 		$mount_lines
 
@@ -711,26 +795,26 @@ cmd_internal_sync() {
 		Private=no
 		NSPAWN
 
-		cat > "$app_dir/start.sh" <<-STARTSH
+		cat > "$release_dir/${svc}.service" <<-SERVICE
+		[Unit]
+		Description=deploy $app_name $release_id
+		After=network.target
+
+		[Service]
+		Type=notify
+		ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit --settings=override -D $release_dir/machine --machine=$svc
+		Restart=on-failure
+		KillMode=mixed
+		SERVICE
+
+		cat > "$release_dir/start.sh" <<-STARTSH
 		#!/bin/bash
-		export PORT=$port
 		cd /app
 		exec $start_cmd
 		STARTSH
-		chmod +x "$app_dir/start.sh"
+		chmod +x "$release_dir/start.sh"
 	fi
 
-	if [ -n "$domain" ]; then caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true; fi
-	if $is_static; then
-		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then
-			systemctl stop "deploy@$app_name"
-			systemctl disable "deploy@$app_name"
-		fi
-	else
-		systemctl daemon-reload
-		systemctl is-enabled "deploy@$app_name.service" &>/dev/null || systemctl enable "deploy@$app_name.service"
-		systemctl restart "deploy@$app_name"
-	fi
 	log "✅ Configuration synced"
 }
 
@@ -742,17 +826,16 @@ cmd_uninstall() {
 
 	log "🗑️  Uninstalling deploy.sh..."
 
-	for app_dir in "$DEPLOY_ROOT"/*/; do
-		if [ ! -d "$app_dir" ]; then continue; fi
-		local app_name=$(basename "$app_dir")
-		if systemctl is-active --quiet "deploy@$app_name" 2>/dev/null; then log "  Stopping deploy@$app_name..."; systemctl stop "deploy@$app_name"; fi
-		if systemctl is-enabled --quiet "deploy@$app_name" 2>/dev/null; then systemctl disable "deploy@$app_name"; fi
+	for svc_file in /etc/systemd/system/deploy-*.service; do
+		[ -f "$svc_file" ] || continue
+		local svc; svc=$(basename "$svc_file" .service)
+		systemctl stop "$svc" 2>/dev/null || true
+		systemctl disable "$svc" 2>/dev/null || true
 	done
 	if systemctl is-active --quiet caddy 2>/dev/null; then log "  Stopping caddy..."; systemctl stop caddy; fi
 	if systemctl is-enabled --quiet caddy 2>/dev/null; then systemctl disable caddy; fi
-	rm -f /etc/systemd/system/caddy.service /usr/local/bin/caddy
+	rm -f /usr/local/bin/caddy
 
-	systemctl disable deploy@.service 2>/dev/null || true
 	rm -f /etc/sudoers.d/deploy
 	systemctl daemon-reload
 
