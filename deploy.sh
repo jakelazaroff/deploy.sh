@@ -28,6 +28,15 @@ log() { echo "$@" >&2; }
 
 require_arg() { [ -n "${1:-}" ] || die "$2"; }
 
+# Privilege escalation: non-deploy users hop to the deploy user first (any user
+# can via /etc/sudoers.d/deploy), then deploy escalates to root.
+# exec replaces this process — the lines below never run if escalation happens.
+escalate() {
+	[ "$(id -u)" -eq 0 ] && return
+	[ "$(id -un)" != "$DEPLOY_USER" ] && exec sudo -u "$DEPLOY_USER" "$0" "$@"
+	exec sudo "$0" "$@"
+}
+
 # Deploy status tracking: cmd_deploy_app sets these globals so the EXIT trap
 # can write a "failed" status if the deploy exits early (e.g. build failure).
 _DEPLOY_STATUS_FILE=""
@@ -152,6 +161,8 @@ cmd_init() {
 	log "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	# --- Install dependencies ---
+
+	# install system dependencies
 	local to_install=()
 	command -v systemd-nspawn &>/dev/null || to_install+=(systemd-container)
 	command -v jq &>/dev/null || to_install+=(jq)
@@ -164,6 +175,18 @@ cmd_init() {
 		else
 			die "Missing ${to_install[*]} — install manually"
 		fi
+	fi
+
+	# install caddy
+	if ! command -v caddy &>/dev/null; then
+		local caddy_arch; case "$(uname -m)" in
+			x86_64)  caddy_arch=amd64 ;;
+			aarch64) caddy_arch=arm64 ;;
+			armv7l)  caddy_arch=armv7 ;;
+			*)       die "Unsupported architecture for Caddy: $(uname -m)" ;;
+		esac
+		curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=$caddy_arch" -o /usr/local/bin/caddy
+		chmod +x /usr/local/bin/caddy
 	fi
 
 	# --- Create deploy user ---
@@ -187,6 +210,7 @@ cmd_init() {
 		log "⚠️  No authorized_keys found — add your public key manually to /home/$DEPLOY_USER/.ssh/authorized_keys"
 	fi
 
+	# --- Create deploy directory ---
 	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
@@ -198,22 +222,8 @@ cmd_init() {
 		if [ -z "$alpine_file" ]; then die "Could not find Alpine minirootfs for $arch"; fi
 		mkdir -p "$DEPLOY_ROOT/.internal/machine"
 		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
-		log "🔧 Installing bash in base image..."
 		systemd-nspawn -D "$DEPLOY_ROOT/.internal/machine" /bin/sh -c "apk update && apk add --no-cache bash"
 		log "✅ Base image ready"
-	fi
-
-	# --- Install Caddy ---
-	if ! command -v caddy &>/dev/null; then
-		log "📦 Installing Caddy..."
-		local caddy_arch; case "$(uname -m)" in
-			x86_64)  caddy_arch=amd64 ;;
-			aarch64) caddy_arch=arm64 ;;
-			armv7l)  caddy_arch=armv7 ;;
-			*)       die "Unsupported architecture for Caddy: $(uname -m)" ;;
-		esac
-		curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=$caddy_arch" -o /usr/local/bin/caddy
-		chmod +x /usr/local/bin/caddy
 	fi
 
 	# --- Create Caddyfile ---
@@ -442,8 +452,9 @@ cmd_logs() {
 			;;
 		# --- Build logs: saved output from the build step ---
 		build)
-			local log_file="$DEPLOY_ROOT/$app_name/build.log"
-			if [ ! -f "$log_file" ]; then die "No build log found for $app_name"; fi
+			local rid="${release:-$(get_active_release "$app_name")}" || die "No active release"
+			local log_file="$DEPLOY_ROOT/$app_name/releases/$rid/build.log"
+			if [ ! -f "$log_file" ]; then die "No build log found${release:+ for release $release}"; fi
 			{ if $follow; then tail -f ${num:+-n "$num"} "$log_file"
 			  else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
 			  fi } | pager "$follow" "$no_pager"
@@ -637,7 +648,7 @@ cmd_deploy_app() {
 	local release_dir="$app_dir/releases/$release_id"
 
 	local status_file="$app_dir/deploy.status"
-	local build_log="$app_dir/build.log"
+	local build_log="$release_dir/build.log"
 	local start_time; start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 	printf 'status=running\nstarted=%s\npid=%s\n' "$start_time" "$$" > "$status_file"
 	_DEPLOY_STATUS_FILE="$status_file"; _DEPLOY_START_TIME="$start_time"
@@ -890,25 +901,16 @@ cmd_help() {
 
 	deploy.conf (in repo root):
 	  start=npm start                     Start command (omit for static sites)
-	  build=npm ci && npm run build       Build command (runs in container)
+	  build=npm ci && npm run build       Build command
 	  assets=public                       Static assets directory
 	  spa=true                            Single-page app mode
 	  header=/path Name: value            Response header (repeatable)
 
 	server.conf (on server, in app directory):
 	  domain=yourdomain.com               Domain
-	  env=SECRET_KEY=...                  Environment variable
-	  mount=/data:/app/data               Bind mount (append :ro for read-only)
+	  env=SECRET_KEY=...                  Environment variable (repeatable)
+	  mount=/data:/app/data[:ro]          Bind mount (repeatable; append :ro for read-only)
 	HELP
-}
-
-# Privilege escalation: non-deploy users hop to the deploy user first (any user
-# can via /etc/sudoers.d/deploy), then deploy escalates to root.
-# exec replaces this process — the lines below never run if escalation happens.
-escalate() {
-	[ "$(id -u)" -eq 0 ] && return
-	[ "$(id -un)" != "$DEPLOY_USER" ] && exec sudo -u "$DEPLOY_USER" "$0" "$@"
-	exec sudo "$0" "$@"
 }
 
 case "${1:-help}" in
