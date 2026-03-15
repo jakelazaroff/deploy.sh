@@ -27,20 +27,20 @@ On the other hand, deploy.sh is a single ~500 line shell script that you can rea
 ├── .internal/
 │   ├── machine/              # Alpine Linux base image
 │   ├── caddy.service         # Caddy systemd unit (linked into /etc/systemd/system/)
-│   ├── deploy@.service       # Container systemd template (linked into /etc/systemd/system/)
 │   ├── Caddyfile             # Global Caddy config (imports all app caddy.conf files)
-│   └── ports                 # Port assignments (app-name=port)
+│   └── ports                 # Port assignments (app--release=port)
 └── <app-name>/
     ├── repo.git/             # Bare git repo (push target)
     ├── releases/
-    │   └── <YYYYMMDD-HHMMSS>/  # Checkout of each deploy (last 5 kept)
-    ├── current -> releases/<timestamp>  # Symlink to active release
-    ├── machine/              # Container filesystem (systemd-nspawn); only for containerized apps
+    │   └── <YYYYMMDDHHMMSS>/ # Checkout of each deploy (last 5 kept)
+    │       ├── deploy.conf   # App config (committed in repo)
+    │       ├── machine/      # Container rootfs (container apps only)
+    │       ├── start.sh      # Container entrypoint (container apps only)
+    │       └── deploy-<app>--<release>.service  # systemd unit (container apps only)
+    ├── current -> releases/<latest>  # Symlink to active release
     ├── data/                 # Persistent data volume (mounted as /data inside container)
-    ├── deploy-<app-name>.nspawn  # systemd-nspawn container settings
-    ├── caddy.conf            # Per-app Caddy config snippet
+    ├── caddy.conf            # Per-app Caddy config snippet (generated)
     ├── server.conf           # Server-side config (domain, env, mounts)
-    ├── start.sh              # Container entrypoint (sets $PORT, runs start command)
     └── access.log            # HTTP access log (JSON; written by Caddy)
 ```
 
@@ -103,4 +103,4 @@ mount=/etc/secrets:/app/secrets:ro
 env=SECRET_KEY=...
 ```
 
-Changes to server.conf take effect on next `git push` or `deploy _sync <name>`.
+Changes to server.conf take effect on next `git push` or `deploy config <name> --edit`.
