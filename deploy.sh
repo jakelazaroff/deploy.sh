@@ -14,6 +14,9 @@ set -euo pipefail
 
 DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
+PORT_RANGE_START=49152   # first ephemeral port
+PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
+MAX_RELEASES=5           # number of old releases to keep
 
 # UTILITIES
 
@@ -23,13 +26,13 @@ die() { echo "⚠️ $1" >&2; exit 1; }
 # Print a progress message to stderr
 log() { echo "$@" >&2; }
 
-require_arg() { [ -n "$1" ] || die "$2"; }
+require_arg() { [ -n "${1:-}" ] || die "$2"; }
 
-# Global state for deploy status tracking
+# Deploy status tracking: cmd_deploy_app sets these globals so the EXIT trap
+# can write a "failed" status if the deploy exits early (e.g. build failure).
 _DEPLOY_STATUS_FILE=""
 _DEPLOY_START_TIME=""
 _deploy_exit_trap() {
-	local code=$?
 	[ -z "$_DEPLOY_STATUS_FILE" ] && return
 	local finish; finish=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 	printf 'status=failed\nstarted=%s\nfinished=%s\n' "$_DEPLOY_START_TIME" "$finish" > "$_DEPLOY_STATUS_FILE"
@@ -41,7 +44,7 @@ check_domain_collision() {
 	local server_conf
 	for server_conf in "$DEPLOY_ROOT"/*/server.conf; do
 		if [ ! -f "$server_conf" ]; then continue; fi
-		local app_name=$(basename "$(dirname "$server_conf")")
+		local app_name; app_name=$(basename "$(dirname "$server_conf")")
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
 		local existing_domain; existing_domain=$(get_conf "$server_conf" "domain")
@@ -53,7 +56,7 @@ check_domain_collision() {
 get_conf() {
 	local file=$1 key=$2 default=${3:-}
 	if [ ! -f "$file" ]; then echo "$default"; return; fi
-	local value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-)
+	local value; value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-)
 	echo "${value:-$default}"
 }
 
@@ -71,7 +74,7 @@ assign_port() {
 		flock -x 9
 		local existing; existing=$(grep "^$key=" "$ports_file" 2>/dev/null | cut -d= -f2)
 		if [ -n "$existing" ]; then echo "$existing"; exit 0; fi
-		local port=49152
+		local port=$PORT_RANGE_START
 		while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
 		echo "$key=$port" >> "$ports_file"
 		echo "$port"
@@ -95,7 +98,7 @@ clone_release() {
 }
 
 wait_for_port() {
-	local port=$1 i=60
+	local port=$1 i=$((PORT_WAIT_SECONDS * 2))
 	while ! ss -tln "sport = :$port" | grep -q LISTEN; do
 		sleep 0.5; ((i--)) || return 1
 	done
@@ -122,7 +125,7 @@ activate_release() {
 			systemctl stop "$svc" 2>/dev/null || true
 			systemctl disable "$svc" 2>/dev/null || true
 			sed -i "/^${app_name}--${release_id}=/d" "$ports_file"
-			die "New instance failed to start on port $port after 30s"
+			die "New instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
 		fi
 
 		ln -sfn "releases/$release_id" "$app_dir/current"
@@ -143,23 +146,30 @@ activate_release() {
 
 # SUBCOMMANDS
 
+# Initialize the deployment system (must be run as root)
 cmd_init() {
 	if [ "$(id -u)" -ne 0 ]; then die "deploy init must be run as root"; fi
 	log "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
 
-	if ! command -v systemd-nspawn &>/dev/null; then
-		log "📦 Installing systemd-container..."
+	# --- Install dependencies ---
+	local to_install=()
+	command -v systemd-nspawn &>/dev/null || to_install+=(systemd-container)
+	command -v jq &>/dev/null || to_install+=(jq)
+	if [ ${#to_install[@]} -gt 0 ]; then
+		log "📦 Installing ${to_install[*]}..."
 		if command -v apt-get &>/dev/null; then
-			apt-get install -y systemd-container
+			apt-get install -y "${to_install[@]}"
 		elif command -v dnf &>/dev/null; then
-			dnf install -y systemd-container
+			dnf install -y "${to_install[@]}"
 		else
-			die "systemd-nspawn not found — install systemd-container manually"
+			die "Missing ${to_install[*]} — install manually"
 		fi
 	fi
 
+	# --- Create deploy user ---
 	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; log "✅ Created user: $DEPLOY_USER"; }
 
+	# --- Copy SSH keys ---
 	local src_keys=""
 	if [ -n "$SUDO_USER" ]; then
 		local src_home; src_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
@@ -180,6 +190,7 @@ cmd_init() {
 	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 
+	# --- Pull Alpine base image ---
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
 		log "📦 Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
@@ -192,6 +203,7 @@ cmd_init() {
 		log "✅ Base image ready"
 	fi
 
+	# --- Install Caddy ---
 	if ! command -v caddy &>/dev/null; then
 		log "📦 Installing Caddy..."
 		local caddy_arch; case "$(uname -m)" in
@@ -204,6 +216,7 @@ cmd_init() {
 		chmod +x /usr/local/bin/caddy
 	fi
 
+	# --- Create Caddyfile ---
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
@@ -250,6 +263,7 @@ cmd_init() {
 		log "📝 Created Caddyfile"
 	fi
 
+	# --- Create Caddy systemd service ---
 	cat > "$DEPLOY_ROOT/.internal/caddy.service" <<-SERVICE
 	[Unit]
 	Description=Caddy
@@ -268,6 +282,7 @@ cmd_init() {
 
 	systemctl enable "$DEPLOY_ROOT/.internal/caddy.service" && systemctl start caddy
 
+	# --- Set up sudoers ---
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	Defaults env_keep += "SSH_AUTH_SOCK"
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
@@ -283,21 +298,23 @@ cmd_init() {
 	log "Next: deploy create <app-name>"
 }
 
+# Create a new app and its bare git repo
 cmd_create() {
-	require_arg "$1" "Usage: deploy create <app-name>"
+	escalate create "$@"
+	require_arg "${1:-}" "Usage: deploy create <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
 	log "📦 Creating app: $app_name"
 	mkdir -p "$app_dir"/{releases,repo.git}
-	cd "$app_dir/repo.git" && git init --bare --initial-branch=main
+	git init --bare --initial-branch=main "$app_dir/repo.git"
 
-	cat > hooks/post-receive <<-HOOK
+	cat > "$app_dir/repo.git/hooks/post-receive" <<-HOOK
 	#!/bin/bash
 	sudo /usr/local/bin/deploy _deploy-app $app_name
 	HOOK
-	chmod +x hooks/post-receive
+	chmod +x "$app_dir/repo.git/hooks/post-receive"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 
 	log "✅ Created app: $app_name"
@@ -309,14 +326,18 @@ cmd_create() {
 	log "See 'deploy help' for deploy.conf format."
 }
 
+# List all apps (no privileges needed)
 cmd_list() {
 	for app_dir in "$DEPLOY_ROOT"/*/; do
-		[ -d "$app_dir" ] && printf '%s\n' "$(basename "$app_dir")"
+		[ -d "$app_dir" ] || continue
+		[[ "$(basename "$app_dir")" == .* ]] && continue
+		printf '%s\n' "$(basename "$app_dir")"
 	done
 }
 
+# Show detailed info about an app (no privileges needed)
 cmd_info() {
-	require_arg "$1" "Usage: deploy info <app-name>"
+	require_arg "${1:-}" "Usage: deploy info <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
@@ -372,19 +393,23 @@ cmd_info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
+# Pipe to pager unless following output (-f) or user passed --no-pager
 pager() {
 	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
 }
 
 
+# View app logs (journald), build output, or HTTP access logs
 cmd_logs() {
-	require_arg "$1" "Usage: deploy logs <app-name> [app|build|access] [options...]"
+	escalate logs "$@"
+	require_arg "${1:-}" "Usage: deploy logs <app-name> [app|build|access] [options...]"
 	local app_name=$1; shift
 	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
 
 	local stream="app"
 	case "${1:-}" in app|build|access) stream=$1; shift ;; esac
 
+	# Options: -f and -n apply to all streams; --since/--before apply to app and access
 	local follow=false no_pager=false num="" since="" before="" release=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -400,6 +425,7 @@ cmd_logs() {
 	done
 
 	case "$stream" in
+		# --- App logs: container stdout/stderr via journald ---
 		app)
 			local unit
 			if [ -n "$release" ]; then
@@ -414,6 +440,7 @@ cmd_logs() {
 			[ -n "$before" ] && args+=(--before "$before")
 			journalctl "${args[@]}" | pager "$follow" "$no_pager"
 			;;
+		# --- Build logs: saved output from the build step ---
 		build)
 			local log_file="$DEPLOY_ROOT/$app_name/build.log"
 			if [ ! -f "$log_file" ]; then die "No build log found for $app_name"; fi
@@ -421,6 +448,7 @@ cmd_logs() {
 			  else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
 			  fi } | pager "$follow" "$no_pager"
 			;;
+		# --- Access logs: Caddy JSON logs, parsed into human-readable format ---
 		access)
 			local log_file="$DEPLOY_ROOT/$app_name/access.log"
 			if [ ! -f "$log_file" ]; then die "No access log found for $app_name"; fi
@@ -428,40 +456,27 @@ cmd_logs() {
 			[ -n "$since" ]  && { since_ts=$(date -d "$since" +%s 2>/dev/null)  || die "Invalid --since date: $since"; }
 			[ -n "$before" ] && { before_ts=$(date -d "$before" +%s 2>/dev/null) || die "Invalid --before date: $before"; }
 			# Parse Caddy JSON log lines into human-readable format
+			local jq_filter='select(
+				(if $since  != "" then .ts >= ($since  | tonumber) else true end) and
+				(if $before != "" then .ts <= ($before | tonumber) else true end) and
+				(if $release != "" then .release == $release else true end)
+			) | [(.ts | strftime("%Y/%m/%d %H:%M:%S")), .request.method, .request.uri,
+			      (.status | tostring), (.size | tostring), "-", (((.duration * 1000) | floor | tostring) + " ms")] | join(" ")'
 			{
 				if $follow; then tail -f ${num:+-n "$num"} "$log_file"
 				else cat "$log_file"
 				fi \
-				| awk -v since="$since_ts" -v before="$before_ts" -v filter_release="$release" '
-				{
-					# Extract timestamp: "ts":1234567890.123
-					if (match($0, /"ts":[0-9.]+/))
-						ts = substr($0, RSTART+5, RLENGTH-5) + 0
-
-					# Filter by time range and release
-					if (since  != "" && ts < since+0)  next
-					if (before != "" && ts > before+0) next
-					if (filter_release != "" && !match($0, "\"release\":\"" filter_release "\"")) next
-
-					# Extract fields from JSON: "key":"value" or "key":number
-					method = uri = status = size = ms = "-"
-					if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
-					if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
-					if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
-					if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
-					if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
-
-					printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
-				}
-				' \
+				| jq -r --arg since "$since_ts" --arg before "$before_ts" --arg release "$release" "$jq_filter" \
 				| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
 			} | pager "$follow" "$no_pager"
 			;;
 	esac
 }
 
+# Show or edit server.conf; --edit redeploys with the new config
 cmd_config() {
-	require_arg "$1" "Usage: deploy config <app-name>"
+	escalate config "$@"
+	require_arg "${1:-}" "Usage: deploy config <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	local server_conf="$app_dir/server.conf"
@@ -486,8 +501,10 @@ _key_fingerprint() {
 	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
 }
 
+# Manage restricted SSH deploy keys for an app
 cmd_keys() {
-	require_arg "$1" "Usage: deploy keys <app-name> [add|remove] [args...]"
+	escalate keys "$@"
+	require_arg "${1:-}" "Usage: deploy keys <app-name> [add|remove] [args...]"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
@@ -499,7 +516,7 @@ cmd_keys() {
 				[[ "$line" != *" deploy:$app_name:"* ]] && continue
 				found=true
 				local raw_key="${line#*no-pty }"
-				local key_name="${raw_key##*deploy:$app_name:}"
+				local key_name="${raw_key##*deploy:"$app_name":}"
 				printf "%-24s  %s\n" "$key_name" "$(_key_fingerprint "$raw_key")"
 			done < "$auth_keys"
 			$found || log "(no deploy keys for $app_name)"
@@ -543,19 +560,24 @@ cmd_keys() {
 	esac
 }
 
+# Restart an app's running container
 cmd_restart() {
-	require_arg "$1" "Usage: deploy restart <app-name>"
-	local release_id; release_id=$(get_active_release "$1") || die "No active release"
-	log "🔄 Restarting $1..."
-	if systemctl restart "deploy-${1}--${release_id}"; then
+	escalate restart "$@"
+	require_arg "${1:-}" "Usage: deploy restart <app-name>"
+	local app_name=$1
+	local release_id; release_id=$(get_active_release "$app_name") || die "No active release"
+	log "🔄 Restarting $app_name..."
+	if systemctl restart "deploy-${app_name}--${release_id}"; then
 		log "✅ Restarted"
 	else
-		die "Failed to restart $1"
+		die "Failed to restart $app_name"
 	fi
 }
 
+# Roll back to the previous release
 cmd_rollback() {
-	require_arg "$1" "Usage: deploy rollback <app-name>"
+	escalate rollback "$@"
+	require_arg "${1:-}" "Usage: deploy rollback <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
@@ -579,8 +601,10 @@ cmd_rollback() {
 	activate_release "$app_name" "$new_release"
 }
 
+# Remove an app and all its files
 cmd_remove() {
-	require_arg "$1" "Usage: deploy remove <app-name> [-f]"
+	escalate remove "$@"
+	require_arg "${1:-}" "Usage: deploy remove <app-name> [-f]"
 	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
@@ -605,8 +629,9 @@ cmd_remove() {
 	log "✅ Removed $app_name"
 }
 
+# Internal: deploy an app (called by git post-receive hook)
 cmd_deploy_app() {
-	require_arg "$1" "Internal error: app name required"
+	require_arg "${1:-}" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_id; release_id=$(date +%Y%m%d%H%M%S)
 	local release_dir="$app_dir/releases/$release_id"
@@ -619,22 +644,21 @@ cmd_deploy_app() {
 	trap '_deploy_exit_trap' EXIT
 
 	log "📦 Deploying $app_name..."
-	local repo_dir=$(pwd)
+	local repo_dir; repo_dir=$(pwd)
 	unset GIT_DIR
 	# Clone rather than checkout so that .git lives inside the release dir. This
 	# keeps all git metadata (gitdir pointers, core.worktree, submodule configs)
 	# self-relative to the release dir, which means they resolve correctly when
 	# the dir is mounted at /build inside the build container.
 	git clone --local --quiet "$repo_dir" "$release_dir"
-	cd "$release_dir"
 	if [ -f "$release_dir/.gitmodules" ]; then
 		log "📦 Initializing submodules..."
 		GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$release_dir" submodule update --init --recursive
 	fi
 
 	local deploy_conf="$release_dir/deploy.conf"
-	local start_cmd=$(get_conf "$deploy_conf" "start")
-	local build_cmd=$(get_conf "$deploy_conf" "build")
+	local start_cmd; start_cmd=$(get_conf "$deploy_conf" "start")
+	local build_cmd; build_cmd=$(get_conf "$deploy_conf" "build")
 
 	local server_conf="$app_dir/server.conf"
 	local setenv_args=()
@@ -671,14 +695,16 @@ cmd_deploy_app() {
 	cmd_configure "$app_name" "$release_id"
 	activate_release "$app_name" "$release_id"
 
-	# Prune old releases
+	# Prune old releases (subshell so cd doesn't affect the caller)
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	cd "$app_dir/releases" && ls -t | tail -n +6 | while read -r old; do
-		systemctl stop "deploy-${app_name}--${old}" 2>/dev/null || true
-		systemctl disable "deploy-${app_name}--${old}" 2>/dev/null || true
-		sed -i "/^${app_name}--${old}=/d" "$ports_file"
-		rm -rf "$old"
-	done
+	(
+		cd "$app_dir/releases" && ls -t | tail -n +$((MAX_RELEASES + 1)) | while read -r old; do
+			systemctl stop "deploy-${app_name}--${old}" 2>/dev/null || true
+			systemctl disable "deploy-${app_name}--${old}" 2>/dev/null || true
+			sed -i "/^${app_name}--${old}=/d" "$ports_file"
+			rm -rf "$old"
+		done
+	)
 	systemctl daemon-reload
 	log "🧹 Cleaned up old releases"
 	log "✅ Deployed $app_name ($release_id)"
@@ -689,22 +715,24 @@ cmd_deploy_app() {
 	_DEPLOY_STATUS_FILE=""
 }
 
+# Internal: generate Caddy config, systemd service, and start.sh for a release
 cmd_configure() {
-	require_arg "$1" "Internal error: app name required"
+	require_arg "${1:-}" "Internal error: app name required"
 	require_arg "${2:-}" "Internal error: release id required"
 	local app_name=$1 release_id=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$release_id"
 	local deploy_conf="$release_dir/deploy.conf" server_conf="$app_dir/server.conf"
-	local start_cmd=$(get_conf "$deploy_conf" "start")
+	local start_cmd; start_cmd=$(get_conf "$deploy_conf" "start")
 	local domain; domain=$(get_conf "$server_conf" "domain")
 	if [ -n "$domain" ]; then check_domain_collision "$domain" "$app_name"; fi
 	local port; port=$(assign_port "$app_name" "$release_id")
 
 	log "🔄 Configuring $app_name..."
 
-	local static_dir=$(get_conf "$deploy_conf" "assets")
-	local spa_mode=$(get_conf "$deploy_conf" "spa")
+	local static_dir; static_dir=$(get_conf "$deploy_conf" "assets")
+	local spa_mode; spa_mode=$(get_conf "$deploy_conf" "spa")
 
+	# --- Generate Caddy config ---
 	if [ -n "$domain" ]; then
 		local handler
 		if [ -z "$start_cmd" ] && [ "$spa_mode" = "true" ]; then
@@ -737,55 +765,68 @@ cmd_configure() {
 		CADDY
 		caddy fmt "$app_dir/caddy.conf" --overwrite
 	else
-		> "$app_dir/caddy.conf"
+		true > "$app_dir/caddy.conf"
 	fi
 
+	# --- Generate systemd service unit and start.sh ---
 	if [ -n "$start_cmd" ]; then
 		local svc="deploy-${app_name}--${release_id}"
 
-		# Build nspawn args, one per line with \ continuation
-		local nspawn_args=""
-		nspawn_args+="    --machine=$svc \\"$'\n'
-		nspawn_args+="    -D $release_dir/machine \\"$'\n'
-		nspawn_args+="    --chdir=/app \\"$'\n'
-		nspawn_args+="    --setenv=PORT=$port \\"$'\n'
+		local nspawn_args=(
+			--quiet
+			"--machine=$svc"
+			-D "$release_dir/machine"
+			--chdir=/app
+			"--setenv=PORT=$port"
+		)
 
 		while IFS= read -r env_var; do
-			nspawn_args+="    \"--setenv=$env_var\" \\"$'\n'
+			nspawn_args+=("--setenv=$env_var")
 		done < <(get_conf_all "$server_conf" "env")
 
-		nspawn_args+="    --bind=$release_dir:/app \\"$'\n'
-		nspawn_args+="    --bind=$app_dir/data:/data \\"$'\n'
-		nspawn_args+="    --bind-ro=/etc/resolv.conf \\"$'\n'
+		nspawn_args+=(
+			"--bind=$release_dir:/app"
+			"--bind=$app_dir/data:/data"
+			--bind-ro=/etc/resolv.conf
+		)
 
 		while IFS= read -r mount; do
 			if [[ "$mount" =~ ^([^:]+):([^:]+):ro$ ]]; then
 				local host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
-				nspawn_args+="    --bind-ro=$host_path:$container_path \\"$'\n'
+				nspawn_args+=("--bind-ro=$host_path:$container_path")
 			elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
 				local host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
-				nspawn_args+="    --bind=$host_path:$container_path \\"$'\n'
+				nspawn_args+=("--bind=$host_path:$container_path")
 			else
 				log "⚠️  Skipping invalid mount: $mount"; continue
 			fi
 			[ ! -e "$host_path" ] && { log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
 		done < <(get_conf_all "$server_conf" "mount")
 
-		nspawn_args+="    /app/start.sh"
+		nspawn_args+=(/app/start.sh)
 
+		# Format nspawn args into the service file, one per line with \ continuation
 		mkdir -p "$app_dir/data"
-		cat > "$release_dir/${svc}.service" <<-SERVICE
-		[Unit]
-		Description=deploy $app_name $release_id
-		After=network.target
+		{
+			cat <<-SERVICE
+			[Unit]
+			Description=deploy $app_name $release_id
+			After=network.target
 
-		[Service]
-		Type=simple
-		ExecStart=/usr/bin/systemd-nspawn --quiet \\
-		$nspawn_args
-		Restart=on-failure
-		KillMode=mixed
-		SERVICE
+			[Service]
+			Type=simple
+			SERVICE
+			printf 'ExecStart=/usr/bin/systemd-nspawn \\\n'
+			local i
+			for ((i = 0; i < ${#nspawn_args[@]} - 1; i++)); do
+				printf '    %s \\\n' "${nspawn_args[i]}"
+			done
+			printf '    %s\n' "${nspawn_args[-1]}"
+			cat <<-SERVICE
+			Restart=on-failure
+			KillMode=mixed
+			SERVICE
+		} > "$release_dir/${svc}.service"
 
 		cat > "$release_dir/start.sh" <<-STARTSH
 		#!/bin/bash
@@ -797,6 +838,7 @@ cmd_configure() {
 	log "✅ Configured"
 }
 
+# Remove all deploy.sh system changes (must be run as root)
 cmd_uninstall() {
 	if [ "$(id -u)" -ne 0 ]; then die "deploy uninstall must be run as root"; fi
 	log "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
@@ -862,6 +904,7 @@ cmd_help() {
 
 # Privilege escalation: non-deploy users hop to the deploy user first (any user
 # can via /etc/sudoers.d/deploy), then deploy escalates to root.
+# exec replaces this process — the lines below never run if escalation happens.
 escalate() {
 	[ "$(id -u)" -eq 0 ] && return
 	[ "$(id -un)" != "$DEPLOY_USER" ] && exec sudo -u "$DEPLOY_USER" "$0" "$@"
@@ -869,32 +912,19 @@ escalate() {
 }
 
 case "${1:-help}" in
-	# No privileges needed
 	help|--help|-h) cmd_help ;;
 	list)           cmd_list ;;
 	info)           shift; cmd_info "$@" ;;
-
-	# Check root internally
-	init)       cmd_init ;;
-	uninstall)  cmd_uninstall ;;
-
-	# Already root (called via sudo from git hook)
-	_deploy-app)  shift; cmd_deploy_app "$@" ;;
-	_configure)   shift; cmd_configure "$@" ;;
-
-	# Escalate: user → deploy → root
-	create|config|logs|keys|restart|rollback|remove)
-		escalate "$@"
-		case "$1" in
-			create)   shift; cmd_create "$@" ;;
-			config)   shift; cmd_config "$@" ;;
-			logs)     shift; cmd_logs "$@" ;;
-			keys)     shift; cmd_keys "$@" ;;
-			restart)  shift; cmd_restart "$@" ;;
-			rollback) shift; cmd_rollback "$@" ;;
-			remove)   shift; cmd_remove "$@" ;;
-		esac
-		;;
-
-	*) die "Unknown command: $1. Run \"deploy help\" for usage" ;;
+	init)           cmd_init ;;
+	uninstall)      cmd_uninstall ;;
+	_deploy-app)    shift; cmd_deploy_app "$@" ;;
+	_configure)     shift; cmd_configure "$@" ;;
+	create)         shift; cmd_create "$@" ;;
+	config)         shift; cmd_config "$@" ;;
+	logs)           shift; cmd_logs "$@" ;;
+	keys)           shift; cmd_keys "$@" ;;
+	restart)        shift; cmd_restart "$@" ;;
+	rollback)       shift; cmd_rollback "$@" ;;
+	remove)         shift; cmd_remove "$@" ;;
+	*)              die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac
