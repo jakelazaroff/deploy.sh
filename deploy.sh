@@ -320,7 +320,7 @@ cmd_info() {
 	local app_conf="$app_dir/server.conf"
 	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
 	local deployed_at=""
-	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:9:2}:${release_name:11:2}"
+	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:8:2}:${release_name:10:2}"
 
 	local start_cmd="" status="" domain="" assets="" spa=""
 	if [ -f "$deployfile" ]; then
@@ -369,10 +369,10 @@ cmd_info() {
 }
 
 # Sets variables in the caller's scope. Callers must declare:
-#   local follow no_pager num since before
+#   local follow no_pager num since before release
 # before calling this function.
 parse_log_args() {
-	follow=false; num=""; since=""; before=""; no_pager=false
+	follow=false; num=""; since=""; before=""; no_pager=false; release=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-f)          follow=true ;;
@@ -380,6 +380,7 @@ parse_log_args() {
 			--since)     shift; since=$1 ;;
 			--before)    shift; before=$1 ;;
 			--no-pager)  no_pager=true ;;
+			--release)   shift; release=$1 ;;
 			*)           die "Unknown option: $1" ;;
 		esac
 		shift
@@ -399,13 +400,18 @@ cmd_logs() {
 	local stream="app"
 	case "${1:-}" in app|build|access) stream=$1; shift ;; esac
 
-	local follow no_pager num since before
+	local follow no_pager num since before release
 	parse_log_args "$@"
 
 	case "$stream" in
 		app)
-			local release_id; release_id=$(get_active_release "$app_name") || die "No active release"
-			local args=(--no-pager -u "deploy-${app_name}--${release_id}")
+			local unit
+			if [ -n "$release" ]; then
+				unit="deploy-${app_name}--${release}"
+			else
+				unit="deploy-${app_name}--*"
+			fi
+			local args=(--no-pager -u "$unit")
 			$follow          && args+=(-f)
 			[ -n "$num" ]    && args+=(-n "$num")
 			[ -n "$since" ]  && args+=(--since "$since")
@@ -429,12 +435,13 @@ cmd_logs() {
 				if $follow; then tail -f ${num:+-n "$num"} "$log_file"
 				else cat "$log_file"
 				fi \
-				| awk -v since="$since_ts" -v before="$before_ts" '
+				| awk -v since="$since_ts" -v before="$before_ts" -v filter_release="$release" '
 					{
 						if (match($0, /"ts":[0-9.]+/))
 							ts = substr($0, RSTART+5, RLENGTH-5) + 0
 						if (since  != "" && ts < since+0)  next
 						if (before != "" && ts > before+0) next
+						if (filter_release != "" && !match($0, "\"release\":\"" filter_release "\"")) next
 
 						method = uri = status = size = ms = "-"
 						if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
@@ -464,7 +471,7 @@ cmd_config() {
 
 		local old_release; old_release=$(get_active_release "$app_name") || die "Not yet deployed"
 		local old_dir="$app_dir/releases/$old_release"
-		local new_release; new_release=$(date +%Y%m%d-%H%M%S)
+		local new_release; new_release=$(date +%Y%m%d%H%M%S)
 		local new_dir="$app_dir/releases/$new_release"
 
 		# Copy release dir: hard-link git tree, real copy machine dir
@@ -577,7 +584,7 @@ cmd_rollback() {
 
 	log "⏪ Rolling back $app_name from $(basename "$current_release") to $(basename "$target")..."
 
-	local new_release; new_release=$(date +%Y%m%d-%H%M%S)
+	local new_release; new_release=$(date +%Y%m%d%H%M%S)
 	local new_dir="$app_dir/releases/$new_release"
 	cp -al "$target" "$new_dir"
 	if [ -d "$new_dir/machine" ]; then
@@ -620,7 +627,7 @@ cmd_remove() {
 cmd_internal_deploy-app() {
 	require_arg "$1" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	local release_id; release_id=$(date +%Y%m%d-%H%M%S)
+	local release_id; release_id=$(date +%Y%m%d%H%M%S)
 	local release_dir="$app_dir/releases/$release_id"
 
 	local status_file="$app_dir/deploy.status"
@@ -742,8 +749,8 @@ cmd_internal_sync() {
 		cat > "$app_dir/caddy.conf" <<-CADDY
 		$domain {
 		    root * $app_dir/current${static_dir:+/$static_dir}
+		    log_append release $release_id
 		    $headers
-
 		    $handler
 				import logging "$app_dir"
 		}
@@ -857,7 +864,7 @@ cmd_help() {
 	  deploy config <name> [--edit]       Show server.conf (--edit to open in ${EDITOR:-${VISUAL:-vi}})
 	  deploy logs <name> [app|build|access] [options...]
 	  Show app logs (default), build output, or HTTP access logs
-	  Options: -f, -n N, --no-pager
+	  Options: -f, -n N, --no-pager, --release ID
 	  app/access also support: --since DATE, --before DATE
 	  deploy keys <name>                  List deploy keys for an app
 	  deploy keys <name> add <key> [pub]  Add a restricted deploy key
