@@ -38,13 +38,13 @@ _deploy_exit_trap() {
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
 
-	local app_conf
-	for app_conf in "$DEPLOY_ROOT"/*/server.conf; do
-		if [ ! -f "$app_conf" ]; then continue; fi
-		local app_name=$(basename "$(dirname "$app_conf")")
+	local server_conf
+	for server_conf in "$DEPLOY_ROOT"/*/server.conf; do
+		if [ ! -f "$server_conf" ]; then continue; fi
+		local app_name=$(basename "$(dirname "$server_conf")")
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
-		local existing_domain; existing_domain=$(get_conf "$app_conf" "domain")
+		local existing_domain; existing_domain=$(get_conf "$server_conf" "domain")
 		if [ "$existing_domain" = "$domain" ]; then die "Domain $domain already used by $app_name"; fi
 	done
 }
@@ -64,9 +64,8 @@ get_conf_all() {
 }
 
 assign_port() {
-	local app_name=$1 release_id=${2:-}
-	local key="$app_name"
-	[ -n "$release_id" ] && key="${app_name}--${release_id}"
+	local app_name=$1 release_id=$2
+	local key="${app_name}--${release_id}"
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	(
 		flock -x 9
@@ -91,13 +90,7 @@ clone_release() {
 	local source_dir="$app_dir/releases/$source_id"
 	local new_dir="$app_dir/releases/$new_id"
 
-	# Hard-link files for speed, but real-copy the container filesystem
-	# (nspawn needs its own machine-id and writable tree per release)
-	cp -al "$source_dir" "$new_dir"
-	if [ -d "$new_dir/machine" ]; then
-		rm -rf "$new_dir/machine"
-		cp -a "$source_dir/machine" "$new_dir/machine"
-	fi
+	cp -a "$source_dir" "$new_dir"
 	rm -f "$new_dir"/deploy-*.service "$new_dir/start.sh"
 }
 
@@ -328,7 +321,7 @@ cmd_info() {
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local deploy_conf="$app_dir/current/deploy.conf"
-	local app_conf="$app_dir/server.conf"
+	local server_conf="$app_dir/server.conf"
 	local release_name; release_name=$(basename "$(readlink "$app_dir/current" 2>/dev/null)" 2>/dev/null)
 	local deployed_at=""
 	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:8:2}:${release_name:10:2}"
@@ -342,7 +335,7 @@ cmd_info() {
 		assets=$(get_conf "$deploy_conf" "assets")
 		spa=$(get_conf "$deploy_conf" "spa")
 	fi
-	domain=$(get_conf "$app_conf" "domain")
+	domain=$(get_conf "$server_conf" "domain")
 
 	local status_file="$app_dir/deploy.status"
 	local deploy_status="" deploy_started="" deploy_finished="" deploy_pid=""
@@ -379,25 +372,6 @@ cmd_info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
-# Sets variables in the caller's scope. Callers must declare:
-#   local follow no_pager num since before release
-# before calling this function.
-parse_log_args() {
-	follow=false; num=""; since=""; before=""; no_pager=false; release=""
-	while [ $# -gt 0 ]; do
-		case "$1" in
-			-f)          follow=true ;;
-			-n)          shift; num=$1 ;;
-			--since)     shift; since=$1 ;;
-			--before)    shift; before=$1 ;;
-			--no-pager)  no_pager=true ;;
-			--release)   shift; release=$1 ;;
-			*)           die "Unknown option: $1" ;;
-		esac
-		shift
-	done
-}
-
 pager() {
 	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
 }
@@ -411,8 +385,19 @@ cmd_logs() {
 	local stream="app"
 	case "${1:-}" in app|build|access) stream=$1; shift ;; esac
 
-	local follow no_pager num since before release
-	parse_log_args "$@"
+	local follow=false no_pager=false num="" since="" before="" release=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-f)          follow=true ;;
+			-n)          shift; num=$1 ;;
+			--since)     shift; since=$1 ;;
+			--before)    shift; before=$1 ;;
+			--no-pager)  no_pager=true ;;
+			--release)   shift; release=$1 ;;
+			*)           die "Unknown option: $1" ;;
+		esac
+		shift
+	done
 
 	case "$stream" in
 		app)
@@ -448,21 +433,26 @@ cmd_logs() {
 				else cat "$log_file"
 				fi \
 				| awk -v since="$since_ts" -v before="$before_ts" -v filter_release="$release" '
-					{
-						if (match($0, /"ts":[0-9.]+/))
-							ts = substr($0, RSTART+5, RLENGTH-5) + 0
-						if (since  != "" && ts < since+0)  next
-						if (before != "" && ts > before+0) next
-						if (filter_release != "" && !match($0, "\"release\":\"" filter_release "\"")) next
+				{
+					# Extract timestamp: "ts":1234567890.123
+					if (match($0, /"ts":[0-9.]+/))
+						ts = substr($0, RSTART+5, RLENGTH-5) + 0
 
-						method = uri = status = size = ms = "-"
-						if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
-						if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
-						if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
-						if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
-						if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
-						printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
-					}
+					# Filter by time range and release
+					if (since  != "" && ts < since+0)  next
+					if (before != "" && ts > before+0) next
+					if (filter_release != "" && !match($0, "\"release\":\"" filter_release "\"")) next
+
+					# Extract fields from JSON: "key":"value" or "key":number
+					method = uri = status = size = ms = "-"
+					if (match($0, /"method":"[^"]+"/))   method = substr($0, RSTART+10, RLENGTH-11)
+					if (match($0, /"uri":"[^"]+"/))      uri    = substr($0, RSTART+7,  RLENGTH-8)
+					if (match($0, /"status":[0-9]+/))    status = substr($0, RSTART+9,  RLENGTH-9)
+					if (match($0, /"size":[0-9]+/))      size   = substr($0, RSTART+7,  RLENGTH-7)
+					if (match($0, /"duration":[0-9.]+/)) ms     = sprintf("%.0f", substr($0, RSTART+11, RLENGTH-11) * 1000)
+
+					printf "%s %s %s %s %s - %s ms\n", strftime("%Y/%m/%d %H:%M:%S", ts), method, uri, status, size, ms
+				}
 				' \
 				| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
 			} | pager "$follow" "$no_pager"
@@ -474,21 +464,21 @@ cmd_config() {
 	require_arg "$1" "Usage: deploy config <app-name>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
-	local app_conf="$app_dir/server.conf"
+	local server_conf="$app_dir/server.conf"
 
 	if [ "${2:-}" = "--edit" ]; then
-		touch "$app_conf"
-		${EDITOR:-${VISUAL:-vi}} "$app_conf"
+		touch "$server_conf"
+		${EDITOR:-${VISUAL:-vi}} "$server_conf"
 
 		local old_release; old_release=$(get_active_release "$app_name") || die "Not yet deployed"
 		local new_release; new_release=$(date +%Y%m%d%H%M%S)
 		clone_release "$app_name" "$old_release" "$new_release"
 
-		cmd_sync "$app_name" "$new_release"
+		cmd_configure "$app_name" "$new_release"
 		activate_release "$app_name" "$new_release"
 		log "Configuration updated"
 	else
-		if [ -f "$app_conf" ]; then cat "$app_conf"; else log "(no server.conf)"; fi
+		if [ -f "$server_conf" ]; then cat "$server_conf"; else log "(no server.conf)"; fi
 	fi
 }
 
@@ -585,7 +575,7 @@ cmd_rollback() {
 	local new_release; new_release=$(date +%Y%m%d%H%M%S)
 	clone_release "$app_name" "$(basename "$target")" "$new_release"
 
-	cmd_sync "$app_name" "$new_release"
+	cmd_configure "$app_name" "$new_release"
 	activate_release "$app_name" "$new_release"
 }
 
@@ -646,12 +636,16 @@ cmd_deploy_app() {
 	local start_cmd=$(get_conf "$deploy_conf" "start")
 	local build_cmd=$(get_conf "$deploy_conf" "build")
 
-	local app_conf="$app_dir/server.conf"
+	local server_conf="$app_dir/server.conf"
 	local setenv_args=()
 	while IFS= read -r env_var; do
 		setenv_args+=(--setenv="$env_var")
-	done < <(get_conf_all "$app_conf" "env")
+	done < <(get_conf_all "$server_conf" "env")
 
+	# Container setup has three paths:
+	# 1. build + start: build in ephemeral container, which becomes the runtime container
+	# 2. build only:    build in ephemeral container, then discard it (static site)
+	# 3. start only:    clone base image as runtime container (no build step)
 	if [ -n "$build_cmd" ]; then
 		local build_dir="$app_dir/machine-build"
 		rm -rf "$build_dir"
@@ -674,7 +668,7 @@ cmd_deploy_app() {
 		systemd-machine-id-setup --root="$release_dir/machine"
 	fi
 
-	cmd_sync "$app_name" "$release_id"
+	cmd_configure "$app_name" "$release_id"
 	activate_release "$app_name" "$release_id"
 
 	# Prune old releases
@@ -695,18 +689,18 @@ cmd_deploy_app() {
 	_DEPLOY_STATUS_FILE=""
 }
 
-cmd_sync() {
+cmd_configure() {
 	require_arg "$1" "Internal error: app name required"
 	require_arg "${2:-}" "Internal error: release id required"
 	local app_name=$1 release_id=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	local release_dir="$app_dir/releases/$release_id"
-	local deploy_conf="$release_dir/deploy.conf" app_conf="$app_dir/server.conf"
+	local deploy_conf="$release_dir/deploy.conf" server_conf="$app_dir/server.conf"
 	local start_cmd=$(get_conf "$deploy_conf" "start")
-	local domain; domain=$(get_conf "$app_conf" "domain")
+	local domain; domain=$(get_conf "$server_conf" "domain")
 	if [ -n "$domain" ]; then check_domain_collision "$domain" "$app_name"; fi
 	local port; port=$(assign_port "$app_name" "$release_id")
 
-	log "🔄 Syncing configuration for $app_name..."
+	log "🔄 Configuring $app_name..."
 
 	local static_dir=$(get_conf "$deploy_conf" "assets")
 	local spa_mode=$(get_conf "$deploy_conf" "spa")
@@ -758,7 +752,7 @@ cmd_sync() {
 
 		while IFS= read -r env_var; do
 			nspawn_args+="    \"--setenv=$env_var\" \\"$'\n'
-		done < <(get_conf_all "$app_conf" "env")
+		done < <(get_conf_all "$server_conf" "env")
 
 		nspawn_args+="    --bind=$release_dir:/app \\"$'\n'
 		nspawn_args+="    --bind=$app_dir/data:/data \\"$'\n'
@@ -775,7 +769,7 @@ cmd_sync() {
 				log "⚠️  Skipping invalid mount: $mount"; continue
 			fi
 			[ ! -e "$host_path" ] && { log "⚠️  Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
-		done < <(get_conf_all "$app_conf" "mount")
+		done < <(get_conf_all "$server_conf" "mount")
 
 		nspawn_args+="    /app/start.sh"
 
@@ -786,8 +780,8 @@ cmd_sync() {
 		After=network.target
 
 		[Service]
-		Type=notify
-		ExecStart=/usr/bin/systemd-nspawn --quiet --keep-unit \\
+		Type=simple
+		ExecStart=/usr/bin/systemd-nspawn --quiet \\
 		$nspawn_args
 		Restart=on-failure
 		KillMode=mixed
@@ -800,7 +794,7 @@ cmd_sync() {
 		chmod +x "$release_dir/start.sh"
 	fi
 
-	log "✅ Configuration synced"
+	log "✅ Configured"
 }
 
 cmd_uninstall() {
@@ -866,36 +860,41 @@ cmd_help() {
 	HELP
 }
 
-# Privilege escalation: list/info need no privileges; everything else needs root.
-# Non-deploy users hop through the deploy user first (any user can sudo to deploy
-# via /etc/sudoers.d/deploy), then deploy escalates to root.
-case "${1:-}" in
-	init|uninstall|_*|help|--help|-h|"") ;;
-	list|info) ;;
-	*)
-		if [ "$(id -u)" -ne 0 ]; then
-			if [ "$(id -un)" != "$DEPLOY_USER" ]; then
-				exec sudo -u "$DEPLOY_USER" "$0" "$@"
-			fi
-			exec sudo "$0" "$@"
-		fi
-		;;
-esac
+# Privilege escalation: non-deploy users hop to the deploy user first (any user
+# can via /etc/sudoers.d/deploy), then deploy escalates to root.
+escalate() {
+	[ "$(id -u)" -eq 0 ] && return
+	[ "$(id -un)" != "$DEPLOY_USER" ] && exec sudo -u "$DEPLOY_USER" "$0" "$@"
+	exec sudo "$0" "$@"
+}
 
 case "${1:-help}" in
-	init)            cmd_init ;;
-	create)          shift; cmd_create "$@" ;;
-	list)            cmd_list ;;
-	info)            shift; cmd_info "$@" ;;
-	config)          shift; cmd_config "$@" ;;
-	logs)            shift; cmd_logs "$@" ;;
-	keys)            shift; cmd_keys "$@" ;;
-	restart)         shift; cmd_restart "$@" ;;
-	rollback)        shift; cmd_rollback "$@" ;;
-	remove)          shift; cmd_remove "$@" ;;
-	uninstall)       cmd_uninstall ;;
-	_deploy-app)     shift; cmd_deploy_app "$@" ;;
-	_sync)           shift; cmd_sync "$@" ;;
-	help|--help|-h)  cmd_help ;;
-	*)               die "Unknown command: $1. Run \"deploy help\" for usage" ;;
+	# No privileges needed
+	help|--help|-h) cmd_help ;;
+	list)           cmd_list ;;
+	info)           shift; cmd_info "$@" ;;
+
+	# Check root internally
+	init)       cmd_init ;;
+	uninstall)  cmd_uninstall ;;
+
+	# Already root (called via sudo from git hook)
+	_deploy-app)  shift; cmd_deploy_app "$@" ;;
+	_configure)   shift; cmd_configure "$@" ;;
+
+	# Escalate: user → deploy → root
+	create|config|logs|keys|restart|rollback|remove)
+		escalate "$@"
+		case "$1" in
+			create)   shift; cmd_create "$@" ;;
+			config)   shift; cmd_config "$@" ;;
+			logs)     shift; cmd_logs "$@" ;;
+			keys)     shift; cmd_keys "$@" ;;
+			restart)  shift; cmd_restart "$@" ;;
+			rollback) shift; cmd_rollback "$@" ;;
+			remove)   shift; cmd_remove "$@" ;;
+		esac
+		;;
+
+	*) die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac
