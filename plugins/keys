@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# External plugin: keys — Manage SSH deploy keys for an app
+
+PLUGIN_SUMMARY="Manage SSH deploy keys for an app"
+
+_key_fingerprint() {
+	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
+}
+
+plugin_run() { plugin_dispatch "list add remove generate" "$@"; }
+
+keys:list() {
+	require_app "${2:-}"
+	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
+	local found=false
+	while IFS= read -r line; do
+		[[ "$line" != *" deploy:$app_name:"* ]] && continue
+		found=true
+		local raw_key="${line#*no-pty }"
+		local key_name="${raw_key##*deploy:"$app_name":}"
+		printf "%-24s  %s\n" "$key_name" "$(_key_fingerprint "$raw_key")"
+	done < "$auth_keys"
+	$found || log "(no deploy keys for $app_name)"
+}
+
+keys:add() {
+	require_app "${2:-}"
+	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
+	require_arg "${3:-}" "Usage: deploy keys add <app-name> <key-name> [public-key]"
+	local key_name=$3 pubkey="${4:-}"
+	[ -z "$pubkey" ] && read -r pubkey
+	[ -z "$pubkey" ] && die "No public key provided"
+	# Normalize: replace the original comment with "deploy:<app>:<key-name>"
+	# so entries can be listed and removed by name.
+	local keytype keydata _rest
+	read -r keytype keydata _rest <<< "$pubkey"
+	local normalized="$keytype $keydata deploy:$app_name:$key_name"
+	local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
+	echo "$entry" >> "$auth_keys"
+	log "✅ Added deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")"
+}
+
+keys:remove() {
+	require_app "${2:-}"
+	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
+	require_arg "${3:-}" "Usage: deploy keys remove <app-name> <key-name>"
+	local key_name=$3
+	local tmpfile; tmpfile=$(mktemp)
+	local found=false
+	while IFS= read -r line; do
+		if [[ "$line" == *" deploy:$app_name:$key_name" ]]; then
+			found=true; continue
+		fi
+		echo "$line" >> "$tmpfile"
+	done < "$auth_keys"
+	if $found; then
+		mv "$tmpfile" "$auth_keys"
+		log "✅ Removed deploy key '$key_name' from $app_name"
+	else
+		rm -f "$tmpfile"
+		die "Key '$key_name' not found for $app_name"
+	fi
+}
+
+keys:generate() {
+	require_app "${2:-}"
+	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
+	require_arg "${3:-}" "Usage: deploy keys generate <app-name> <key-name>"
+	local key_name=$3
+	local tmpdir; tmpdir=$(mktemp -d)
+	local keyfile="$tmpdir/key"
+	ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "deploy:$app_name:$key_name" >/dev/null 2>&1
+	local pubkey; pubkey=$(cat "$keyfile.pub")
+	# Add the public key using the same logic as "add"
+	local keytype keydata _rest
+	read -r keytype keydata _rest <<< "$pubkey"
+	local normalized="$keytype $keydata deploy:$app_name:$key_name"
+	local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
+	echo "$entry" >> "$auth_keys"
+	log "✅ Generated deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")" >&2
+	log "" >&2
+	cat "$keyfile"
+	rm -rf "$tmpdir"
+}
+
+plugin_help() {
+	cat <<-HELP
+	Usage: deploy keys <command> <app> [args...]
+
+	Commands:
+	  list <app>                     List deploy keys for an app
+	  add <app> <key> [pubkey]  Add a restricted deploy key
+	  remove <app> <key>        Remove a deploy key by name
+	  generate <app> <key>      Generate a new key pair (prints private key)
+	HELP
+}
