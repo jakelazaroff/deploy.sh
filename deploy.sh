@@ -56,8 +56,10 @@ check_domain_collision() {
 		local app_name; app_name=$(basename "$(dirname "$server_conf")")
 		if [ "$app_name" = "$exclude_app" ]; then continue; fi
 
-		local existing_domain; existing_domain=$(get_conf "$server_conf" "domain")
-		if [ "$existing_domain" = "$domain" ]; then die "Domain $domain already used by $app_name"; fi
+		local existing_domain
+		while IFS= read -r existing_domain; do
+			if [ "$existing_domain" = "$domain" ]; then die "Domain $domain already used by $app_name"; fi
+		done < <(get_conf_all "$server_conf" "domain")
 	done
 }
 
@@ -104,6 +106,36 @@ clone_release() {
 
 	cp -a "$source_dir" "$new_dir"
 	rm -f "$new_dir"/deploy-*.service "$new_dir/start.sh"
+}
+
+# Clone the current release, re-configure, and activate.
+# Used by domains/env/mounts add/remove to apply config changes.
+reconfigure() {
+	local app_name=$1
+	local old_release; old_release=$(get_active_release "$app_name") || die "Not yet deployed"
+	local new_release; new_release=$(date +%Y%m%d%H%M%S)
+	clone_release "$app_name" "$old_release" "$new_release"
+	cmd_configure "$app_name" "$new_release"
+	activate_release "$app_name" "$new_release"
+}
+
+# Append key=value to a config file
+conf_add() { echo "$2=$3" >> "$1"; }
+
+# Remove the line matching exactly key=value
+conf_remove_value() {
+	local file=$1 key=$2 value=$3
+	local tmp; tmp=$(mktemp)
+	grep -v "^${key}=${value}$" "$file" > "$tmp" || true
+	mv "$tmp" "$file"
+}
+
+# Remove all lines matching key=*
+conf_remove_key() {
+	local file=$1 key=$2
+	local tmp; tmp=$(mktemp)
+	grep -v "^${key}=" "$file" > "$tmp" || true
+	mv "$tmp" "$file"
 }
 
 wait_for_port() {
@@ -357,7 +389,7 @@ cmd_info() {
 	local deployed_at=""
 	[ -n "$release_name" ] && deployed_at="${release_name:0:4}-${release_name:4:2}-${release_name:6:2} ${release_name:8:2}:${release_name:10:2}"
 
-	local start_cmd="" status="" domain="" assets="" spa=""
+	local start_cmd="" status="" assets="" spa=""
 	if [ -f "$deploy_conf" ]; then
 		start_cmd=$(get_conf "$deploy_conf" "start")
 		if [ -n "$start_cmd" ] && [ -n "$release_name" ]; then
@@ -366,7 +398,7 @@ cmd_info() {
 		assets=$(get_conf "$deploy_conf" "assets")
 		spa=$(get_conf "$deploy_conf" "spa")
 	fi
-	domain=$(get_conf "$server_conf" "domain")
+	local domains_list; domains_list=$(get_conf_all "$server_conf" "domain")
 
 	local status_file="$app_dir/deploy.status"
 	local deploy_status="" deploy_started="" deploy_finished="" deploy_pid=""
@@ -398,7 +430,7 @@ cmd_info() {
 	else
 		echo "┆ Type:    static"
 	fi
-	[ -n "$domain" ] && echo "┆ Domain:  $domain"
+	[ -n "$domains_list" ] && echo "┆ Domain:  $(echo "$domains_list" | tr '\n' ' ')"
 	[ -n "$assets" ] && echo "┆ Assets:  $assets"
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
@@ -411,8 +443,8 @@ pager() {
 
 # View app logs (journald), build output, or HTTP access logs
 cmd_logs() {
+	if [ -z "${1:-}" ] || [[ "${1:-}" == --help ]] || [[ "${1:-}" == -h ]]; then cmd_logs_help; return; fi
 	escalate logs "$@"
-	require_arg "${1:-}" "Usage: deploy logs <app-name> [app|build|access] [options...]"
 	local app_name=$1; shift
 	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
 
@@ -423,7 +455,7 @@ cmd_logs() {
 	local follow=false no_pager=false num="" since="" before="" release=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			-f)          follow=true ;;
+			-f|--follow) follow=true ;;
 			-n)          shift; num=$1 ;;
 			--since)     shift; since=$1 ;;
 			--before)    shift; before=$1 ;;
@@ -484,28 +516,139 @@ cmd_logs() {
 	esac
 }
 
-# Show or edit server.conf; --edit redeploys with the new config
-cmd_config() {
-	escalate config "$@"
-	require_arg "${1:-}" "Usage: deploy config <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+# Manage domains for an app
+cmd_domains() {
+	local subcmd="${1:-help}"
+	case "$subcmd" in help|--help|-h) cmd_domains_help; return ;; esac
+	escalate domains "$@"
+	case "$subcmd" in
+		list|add|remove) ;;
+		*) die "Unknown domains command: $subcmd" ;;
+	esac
+	local app_name=${2:-}
+	require_arg "$app_name" "Usage: deploy domains $subcmd <app-name> ..."
+	local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	local server_conf="$app_dir/server.conf"
 
-	if [ "${2:-}" = "--edit" ]; then
-		touch "$server_conf"
-		${EDITOR:-${VISUAL:-vi}} "$server_conf"
+	case "$subcmd" in
+		list)
+			get_conf_all "$server_conf" "domain"
+			;;
+		add)
+			local domain=${3:-}
+			require_arg "$domain" "Usage: deploy domains add <app-name> <domain>"
+			check_domain_collision "$domain" "$app_name"
+			touch "$server_conf"
+			conf_add "$server_conf" "domain" "$domain"
+			log "✅ Added domain $domain to $app_name"
+			reconfigure "$app_name"
+			;;
+		remove)
+			local domain=${3:-}
+			require_arg "$domain" "Usage: deploy domains remove <app-name> <domain>"
+			if ! grep -q "^domain=${domain}$" "$server_conf" 2>/dev/null; then
+				die "Domain $domain not found for $app_name"
+			fi
+			conf_remove_value "$server_conf" "domain" "$domain"
+			log "✅ Removed domain $domain from $app_name"
+			reconfigure "$app_name"
+			;;
+	esac
+}
 
-		local old_release; old_release=$(get_active_release "$app_name") || die "Not yet deployed"
-		local new_release; new_release=$(date +%Y%m%d%H%M%S)
-		clone_release "$app_name" "$old_release" "$new_release"
+# Manage environment variables for an app
+cmd_env() {
+	local subcmd="${1:-help}"
+	case "$subcmd" in help|--help|-h) cmd_env_help; return ;; esac
+	escalate env "$@"
+	case "$subcmd" in
+		list|set|remove) ;;
+		*) die "Unknown env command: $subcmd" ;;
+	esac
+	local app_name=${2:-}
+	require_arg "$app_name" "Usage: deploy env $subcmd <app-name> ..."
+	local app_dir="$DEPLOY_ROOT/$app_name"
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
+	local server_conf="$app_dir/server.conf"
 
-		cmd_configure "$app_name" "$new_release"
-		activate_release "$app_name" "$new_release"
-		log "Configuration updated"
-	else
-		if [ -f "$server_conf" ]; then cat "$server_conf"; else log "(no server.conf)"; fi
-	fi
+	case "$subcmd" in
+		list)
+			get_conf_all "$server_conf" "env"
+			;;
+		set)
+			local kv=${3:-}
+			require_arg "$kv" "Usage: deploy env set <app-name> KEY=value"
+			[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
+			local key="${kv%%=*}"
+			touch "$server_conf"
+			# Remove existing entries for this key (replace semantics)
+			local tmp; tmp=$(mktemp)
+			grep -v "^env=${key}=" "$server_conf" > "$tmp" || true
+			mv "$tmp" "$server_conf"
+			conf_add "$server_conf" "env" "$kv"
+			log "✅ Set $key for $app_name"
+			reconfigure "$app_name"
+			;;
+		remove)
+			local key=${3:-}
+			require_arg "$key" "Usage: deploy env remove <app-name> KEY"
+			if ! grep -q "^env=${key}=" "$server_conf" 2>/dev/null; then
+				die "Environment variable $key not found for $app_name"
+			fi
+			local tmp; tmp=$(mktemp)
+			grep -v "^env=${key}=" "$server_conf" > "$tmp" || true
+			mv "$tmp" "$server_conf"
+			log "✅ Removed $key from $app_name"
+			reconfigure "$app_name"
+			;;
+	esac
+}
+
+# Manage bind mounts for an app
+cmd_mounts() {
+	local subcmd="${1:-help}"
+	case "$subcmd" in help|--help|-h) cmd_mounts_help; return ;; esac
+	escalate mounts "$@"
+	case "$subcmd" in
+		list|add|remove) ;;
+		*) die "Unknown mounts command: $subcmd" ;;
+	esac
+	local app_name=${2:-}
+	require_arg "$app_name" "Usage: deploy mounts $subcmd <app-name> ..."
+	local app_dir="$DEPLOY_ROOT/$app_name"
+	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
+	local server_conf="$app_dir/server.conf"
+
+	case "$subcmd" in
+		list)
+			get_conf_all "$server_conf" "mount"
+			;;
+		add)
+			local mount=${3:-}
+			require_arg "$mount" "Usage: deploy mounts add <app-name> <host>:<container> [--readonly]"
+			[[ "$mount" == *:* ]] || die "Expected host:container path, got: $mount"
+			if [ "${4:-}" = "--readonly" ]; then mount="${mount}:ro"; fi
+			touch "$server_conf"
+			conf_add "$server_conf" "mount" "$mount"
+			log "✅ Added mount $mount to $app_name"
+			reconfigure "$app_name"
+			;;
+		remove)
+			local mount=${3:-}
+			require_arg "$mount" "Usage: deploy mounts remove <app-name> <host>:<container>"
+			# Remove both the exact value and the :ro variant
+			if grep -q "^mount=${mount}$" "$server_conf" 2>/dev/null; then
+				conf_remove_value "$server_conf" "mount" "$mount"
+			elif grep -q "^mount=${mount}:ro$" "$server_conf" 2>/dev/null; then
+				conf_remove_value "$server_conf" "mount" "${mount}:ro"
+			else
+				die "Mount $mount not found for $app_name"
+			fi
+			log "✅ Removed mount $mount from $app_name"
+			reconfigure "$app_name"
+			;;
+	esac
 }
 
 _key_fingerprint() {
@@ -514,8 +657,8 @@ _key_fingerprint() {
 
 # Manage restricted SSH deploy keys for an app
 cmd_keys() {
+	if [ -z "${1:-}" ] || [[ "${1:-}" == --help ]] || [[ "${1:-}" == -h ]]; then cmd_keys_help; return; fi
 	escalate keys "$@"
-	require_arg "${1:-}" "Usage: deploy keys <app-name> [add|remove] [args...]"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
@@ -565,9 +708,44 @@ cmd_keys() {
 				die "Key '$key_name' not found for $app_name"
 			fi
 			;;
-		*)
-			die "Usage: deploy keys <app-name> [add|remove] [args...]"
+		generate)
+			require_arg "${3:-}" "Usage: deploy keys <app-name> generate <key-name>"
+			local key_name=$3
+			local tmpdir; tmpdir=$(mktemp -d)
+			local keyfile="$tmpdir/key"
+			ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "deploy:$app_name:$key_name" >/dev/null 2>&1
+			local pubkey; pubkey=$(cat "$keyfile.pub")
+			# Add the public key using the same logic as "add"
+			local keytype keydata _rest
+			read -r keytype keydata _rest <<< "$pubkey"
+			local normalized="$keytype $keydata deploy:$app_name:$key_name"
+			local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
+			echo "$entry" >> "$auth_keys"
+			log "✅ Generated deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")" >&2
+			log "" >&2
+			cat "$keyfile"
+			rm -rf "$tmpdir"
 			;;
+		help|--help|-h)
+			cmd_keys_help
+			;;
+		*)
+			die "Unknown keys command: ${2:-}. Run \"deploy keys --help\" for usage"
+			;;
+	esac
+}
+
+# App management namespace
+cmd_apps() {
+	case "${1:-help}" in
+		help|--help|-h) cmd_apps_help ;;
+		list)           cmd_list ;;
+		create)         shift; cmd_create "$@" ;;
+		info)           shift; cmd_info "$@" ;;
+		restart)        shift; cmd_restart "$@" ;;
+		rollback)       shift; cmd_rollback "$@" ;;
+		remove)         shift; cmd_remove "$@" ;;
+		*)              die "Unknown apps command: $1" ;;
 	esac
 }
 
@@ -585,23 +763,38 @@ cmd_restart() {
 	fi
 }
 
-# Roll back to the previous release
+# Roll back to a previous release
 cmd_rollback() {
 	escalate rollback "$@"
-	require_arg "${1:-}" "Usage: deploy rollback <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	require_arg "${1:-}" "Usage: deploy rollback <app-name> [--release <id>]"
+	local app_name=$1; shift; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local current_release; current_release=$(readlink "$app_dir/current" 2>/dev/null)
 	if [ -z "$current_release" ]; then die "No current release for $app_name"; fi
 
-	local target=""
-	for dir in "$app_dir/releases"/*/; do
-		dir="${dir%/}"
-		[[ "$dir" == */"$(basename "$current_release")" ]] && continue
-		[[ "$dir" > "$target" ]] && target="$dir"
+	# Parse --release option
+	local target_id=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--release) shift; target_id=$1 ;;
+			*) die "Unknown option: $1" ;;
+		esac
+		shift
 	done
-	if [ -z "$target" ]; then die "No previous release to roll back to"; fi
+
+	local target=""
+	if [ -n "$target_id" ]; then
+		target="$app_dir/releases/$target_id"
+		if [ ! -d "$target" ]; then die "Release $target_id not found"; fi
+	else
+		for dir in "$app_dir/releases"/*/; do
+			dir="${dir%/}"
+			[[ "$dir" == */"$(basename "$current_release")" ]] && continue
+			[[ "$dir" > "$target" ]] && target="$dir"
+		done
+		if [ -z "$target" ]; then die "No previous release to roll back to"; fi
+	fi
 
 	log "⏪ Rolling back $app_name from $(basename "$current_release") to $(basename "$target")..."
 
@@ -734,8 +927,8 @@ cmd_configure() {
 	local release_dir="$app_dir/releases/$release_id"
 	local deploy_conf="$release_dir/deploy.conf" server_conf="$app_dir/server.conf"
 	local start_cmd; start_cmd=$(get_conf "$deploy_conf" "start")
-	local domain; domain=$(get_conf "$server_conf" "domain")
-	if [ -n "$domain" ]; then check_domain_collision "$domain" "$app_name"; fi
+	local domains; domains=$(get_conf_all "$server_conf" "domain" | tr '\n' ' '); domains="${domains% }"
+	local d; for d in $domains; do check_domain_collision "$d" "$app_name"; done
 	local port; port=$(assign_port "$app_name" "$release_id")
 
 	log "🔄 Configuring $app_name..."
@@ -744,7 +937,7 @@ cmd_configure() {
 	local spa_mode; spa_mode=$(get_conf "$deploy_conf" "spa")
 
 	# --- Generate Caddy config ---
-	if [ -n "$domain" ]; then
+	if [ -n "$domains" ]; then
 		local handler
 		if [ -z "$start_cmd" ] && [ "$spa_mode" = "true" ]; then
 			handler="import spa"
@@ -766,7 +959,7 @@ cmd_configure() {
 		done < <(get_conf_all "$deploy_conf" "header")
 
 		cat > "$app_dir/caddy.conf" <<-CADDY
-		$domain {
+		$domains {
 		    root * $app_dir/current${static_dir:+/$static_dir}
 		    log_append release $release_id
 		    $headers
@@ -852,9 +1045,12 @@ cmd_configure() {
 # Remove all deploy.sh system changes (must be run as root)
 cmd_uninstall() {
 	if [ "$(id -u)" -ne 0 ]; then die "deploy uninstall must be run as root"; fi
-	log "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
-	read -rp "Type 'yes' to confirm: " confirm
-	if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	local force=false; [[ "${1:-}" == "-f" || "${1:-}" == "--force" ]] && force=true
+	if ! $force; then
+		log "⚠️  This will remove all deploy.sh system changes, including all apps and containers."
+		read -rp "Type 'yes' to confirm: " confirm
+		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	fi
 
 	log "🗑️  Uninstalling deploy.sh..."
 
@@ -879,54 +1075,142 @@ cmd_uninstall() {
 
 cmd_help() {
 	cat <<-HELP
-	📦 deploy.sh
+	📦 deploy.sh — minimal VPS deployment system
 
-	Usage:
-	  deploy init                         Initialize the deployment system
-	  deploy create <name>                Create a new app
-	  deploy list                         List all apps
-	  deploy info <name>                  Show app info
-	  deploy config <name> [--edit]       Show server.conf (--edit to open in ${EDITOR:-${VISUAL:-vi}})
-	  deploy logs <name> [app|build|access] [options...]
-	  Show app logs (default), build output, or HTTP access logs
-	  Options: -f, -n N, --no-pager, --release ID
-	  app/access also support: --since DATE, --before DATE
-	  deploy keys <name>                  List deploy keys for an app
-	  deploy keys <name> add <key> [pub]  Add a restricted deploy key
-	  deploy keys <name> remove <key>     Remove a deploy key by name
-	  deploy restart <name>               Restart an app
-	  deploy rollback <name>              Roll back to the previous release
-	  deploy remove <name> [-f]           Remove an app (-f to skip confirmation)
-	  deploy uninstall                    Remove all deploy.sh system changes
+	Usage: deploy <command> [args...]
+
+	Commands:
+	  apps                Manage apps (create, list, info, restart, rollback, remove)
+	  domains             Manage domains for an app
+	  env                 Manage environment variables for an app
+	  logs                View app, build, or access logs
+	  mounts              Manage bind mounts for an app
+	  keys                Manage SSH deploy keys for an app
+
+	Shortcuts:
+	  create <name>       Shortcut for: deploy apps create <name>
+	  list                Shortcut for: deploy apps list
+	  info <name>         Shortcut for: deploy apps info <name>
+	  restart <name>      Shortcut for: deploy apps restart <name>
+	  rollback <name>     Shortcut for: deploy apps rollback <name>
+	  remove <name>       Shortcut for: deploy apps remove <name>
+
+	System:
+	  init                Initialize the deployment system
+	  uninstall [-f]      Remove all deploy.sh system changes
+
+	Run "deploy <command> --help" for details on any command.
 
 	deploy.conf (in repo root):
-	  start=npm start                     Start command (omit for static sites)
-	  build=npm ci && npm run build       Build command
-	  assets=public                       Static assets directory
-	  spa=true                            Single-page app mode
-	  header=/path Name: value            Response header (repeatable)
+	  start=<cmd>         Start command (receives \$PORT; omit for static sites)
+	  build=<cmd>         Build command (runs in ephemeral container)
+	  assets=<dir>        Static assets directory (default: repo root)
+	  spa=true            Single-page app mode
+	  header=<path> <Name>: <value>   Response header (repeatable)
+	HELP
+}
 
-	server.conf (on server, in app directory):
-	  domain=yourdomain.com               Domain
-	  env=SECRET_KEY=...                  Environment variable (repeatable)
-	  mount=/data:/app/data[:ro]          Bind mount (repeatable; append :ro for read-only)
+cmd_apps_help() {
+	cat <<-HELP
+	Usage: deploy apps <command> [args...]
+
+	Commands:
+	  list                List all apps
+	  create <name>       Create a new app
+	  info <name>         Show app status and configuration
+	  restart <name>      Restart an app's container
+	  rollback <name>     Roll back to a previous release
+	  remove <name> [-f]  Remove an app and all its files
+	HELP
+}
+
+cmd_domains_help() {
+	cat <<-HELP
+	Usage: deploy domains <command> <app-name> [args...]
+
+	Commands:
+	  list <name>              List domains for an app
+	  add <name> <domain>      Add a domain to an app
+	  remove <name> <domain>   Remove a domain from an app
+	HELP
+}
+
+cmd_env_help() {
+	cat <<-HELP
+	Usage: deploy env <command> <app-name> [args...]
+
+	Commands:
+	  list <name>              List environment variables for an app
+	  set <name> KEY=value     Set an environment variable
+	  remove <name> KEY        Remove an environment variable
+	HELP
+}
+
+cmd_logs_help() {
+	cat <<-HELP
+	Usage: deploy logs <app-name> [app|build|access] [options...]
+
+	Streams:
+	  app (default)       Container stdout/stderr (journald)
+	  build               Build step output
+	  access              HTTP access logs (Caddy)
+
+	Options:
+	  -f, --follow        Follow log output
+	  -n N                Show last N lines
+	  --since DATE        Show logs since date (app/access only)
+	  --before DATE       Show logs before date (app/access only)
+	  --release ID        Filter by release
+	  --no-pager          Disable pager
+	HELP
+}
+
+cmd_mounts_help() {
+	cat <<-HELP
+	Usage: deploy mounts <command> <app-name> [args...]
+
+	Commands:
+	  list <name>                           List bind mounts for an app
+	  add <name> <host>:<container> [--readonly]   Add a bind mount
+	  remove <name> <host>:<container>      Remove a bind mount
+	HELP
+}
+
+cmd_keys_help() {
+	cat <<-HELP
+	Usage: deploy keys <app-name> <command> [args...]
+
+	Commands:
+	  list                     List deploy keys for an app (default)
+	  add <key-name> [pubkey]  Add a restricted deploy key
+	  remove <key-name>        Remove a deploy key by name
+	  generate <key-name>      Generate a new key pair (prints private key)
 	HELP
 }
 
 case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
-	list)           cmd_list ;;
-	info)           shift; cmd_info "$@" ;;
 	init)           cmd_init ;;
-	uninstall)      cmd_uninstall ;;
+	uninstall)      shift; cmd_uninstall "$@" ;;
+
+	apps)           shift; cmd_apps "$@" ;;
+	domains)        shift; cmd_domains "$@" ;;
+	env)            shift; cmd_env "$@" ;;
+	logs)           shift; cmd_logs "$@" ;;
+	mounts)         shift; cmd_mounts "$@" ;;
+	keys)           shift; cmd_keys "$@" ;;
+
+	# Shortcuts
+	create)         shift; cmd_apps create "$@" ;;
+	list)           cmd_apps list ;;
+	info)           shift; cmd_apps info "$@" ;;
+	restart)        shift; cmd_apps restart "$@" ;;
+	rollback)       shift; cmd_apps rollback "$@" ;;
+	remove)         shift; cmd_apps remove "$@" ;;
+
+	# Internal
 	_deploy-app)    shift; cmd_deploy_app "$@" ;;
 	_configure)     shift; cmd_configure "$@" ;;
-	create)         shift; cmd_create "$@" ;;
-	config)         shift; cmd_config "$@" ;;
-	logs)           shift; cmd_logs "$@" ;;
-	keys)           shift; cmd_keys "$@" ;;
-	restart)        shift; cmd_restart "$@" ;;
-	rollback)       shift; cmd_rollback "$@" ;;
-	remove)         shift; cmd_remove "$@" ;;
+
 	*)              die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac
