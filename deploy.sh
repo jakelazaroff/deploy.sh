@@ -40,13 +40,28 @@ require_app() {
 	server_conf="$app_dir/server.conf"
 }
 
+# Register a subcommand: name | usage | description
+subcmd() { SUBCMDS_DATA="${SUBCMDS_DATA}${1}|${2}|${3}"$'\n'; }
+
 # Validate subcmd, escalate, then call <plugin>:<subcmd> "$@"
-plugin_dispatch() {
-	local valid="$1"; shift
+dispatch() {
 	local subcmd="${1:-}"
+	if [[ "$subcmd" == --help || "$subcmd" == -h || "$subcmd" == help || -z "$subcmd" ]]; then
+		plugin_help_default; return
+	fi
+	local valid; valid=$(printf '%s' "$SUBCMDS_DATA" | cut -d'|' -f1 | tr '\n' ' ')
 	[[ " $valid " == *" $subcmd "* ]] || die "Unknown $PLUGIN_NAME command: $subcmd. Run \"deploy $PLUGIN_NAME --help\" for usage"
 	escalate "$PLUGIN_NAME" "$@"
 	"${PLUGIN_NAME}:${subcmd}" "$@"
+}
+
+# Auto-generate help from subcmd registrations
+plugin_help_default() {
+	printf 'Usage: deploy %s <command> [args...]\n\nCommands:\n' "$PLUGIN_NAME"
+	while IFS='|' read -r name usage desc; do
+		[ -z "$name" ] && continue
+		printf '  %-10s  %-28s  %s\n' "$name" "$usage" "$desc"
+	done <<< "$SUBCMDS_DATA"
 }
 
 # Privilege escalation: non-deploy users hop to the deploy user first (any user
@@ -126,7 +141,7 @@ clone_release() {
 	local new_dir="$app_dir/releases/$new_id"
 
 	cp -a "$source_dir" "$new_dir"
-	rm -f "$new_dir"/deploy-*.service "$new_dir/start.sh"
+	rm -f "$new_dir"/deploy-*.service
 }
 
 # Clone the current release, re-configure, and activate.
@@ -212,14 +227,10 @@ activate_release() {
 load_plugin() {
 	local cmd="$1"; shift
 	PLUGIN_NAME="$cmd"
+	SUBCMDS_DATA=""
 
-	# Try inline plugin first (name-suffixed functions)
+	# try inline plugin first (name-suffixed functions)
 	if declare -f "plugin_run_${cmd}" > /dev/null 2>&1; then
-		if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
-			if declare -f "plugin_help_${cmd}" > /dev/null 2>&1; then
-				"plugin_help_${cmd}"; return
-			fi
-		fi
 		"plugin_run_${cmd}" "$@"
 		return
 	fi
@@ -232,16 +243,118 @@ load_plugin() {
 
 	source "$plugin_file"
 
-	if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
-		if declare -f plugin_help > /dev/null 2>&1; then
-			plugin_help; return
-		fi
+	if declare -f plugin_run > /dev/null 2>&1; then
+		plugin_run "$@"
+	else
+		dispatch "$@"
 	fi
-
-	plugin_run "$@"
 }
 
 # SUBCOMMANDS
+
+# CONFIG GENERATORS
+
+write_global_caddyfile() {
+	local dest=$1 acme_email=$2
+	cat > "$dest" <<-CADDY
+	{
+	    email $acme_email
+	}
+
+	(logging) {
+	    log {
+	        output file {args[0]}/access.log
+	        format json
+	    }
+	}
+
+	(static) {
+	    file_server
+	    encode gzip
+	}
+
+	(proxy) {
+	    reverse_proxy localhost:{args[0]} {
+	        header_up Host {http.request.host}
+	    }
+	}
+
+	(spa) {
+	    try_files {path} /index.html
+	    import static
+	}
+
+	(assets) {
+	    @static file
+	    handle @static {
+	        import static
+	    }
+	    handle {
+	        import proxy {args[0]}
+	    }
+	}
+
+	import $DEPLOY_ROOT/*/caddy.conf
+	CADDY
+}
+
+write_caddy_service() {
+	local dest=$1
+	cat > "$dest" <<-SERVICE
+	[Unit]
+	Description=Caddy
+	After=network.target
+
+	[Service]
+	Type=notify
+	User=root
+	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/.internal/Caddyfile
+	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/.internal/Caddyfile
+	Restart=on-failure
+
+	[Install]
+	WantedBy=multi-user.target
+	SERVICE
+}
+
+write_app_caddy_conf() {
+	local dest=$1 domains=$2 app_dir=$3 release_id=$4 static_dir=$5 headers=$6 handler=$7
+	cat > "$dest" <<-CADDY
+	$domains {
+	    root * $app_dir/current${static_dir:+/$static_dir}
+	    log_append release $release_id
+	    $headers
+	    $handler
+	        import logging "$app_dir"
+	}
+	CADDY
+	caddy fmt "$dest" --overwrite
+}
+
+write_app_service() {
+	local dest=$1 app_name=$2 release_id=$3; shift 3
+	{
+		cat <<-SERVICE
+		[Unit]
+		Description=deploy $app_name $release_id
+		After=network.target
+
+		[Service]
+		Type=simple
+		SERVICE
+		printf 'ExecStart=/usr/bin/systemd-nspawn \\\n'
+		local args=("$@") i
+		for ((i = 0; i < ${#args[@]} - 1; i++)); do
+			printf '    %s \\\n' "${args[i]}"
+		done
+		printf '    %s\n' "${args[-1]}"
+		cat <<-SERVICE
+		Restart=on-failure
+		KillMode=mixed
+		SERVICE
+	} > "$dest"
+}
+
 
 # Initialize the deployment system (must be run as root)
 cmd_init() {
@@ -318,65 +431,12 @@ cmd_init() {
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
-		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
-		{
-		    email $acme_email
-		}
-
-		(logging) {
-		    log {
-		        output file {args[0]}/access.log
-		        format json
-		    }
-		}
-
-		(static) {
-		    file_server
-		    encode gzip
-		}
-
-		(proxy) {
-		    reverse_proxy localhost:{args[0]} {
-		        header_up Host {http.request.host}
-		    }
-		}
-
-		(spa) {
-		    try_files {path} /index.html
-		    import static
-		}
-
-		(assets) {
-		    @static file
-		    handle @static {
-		        import static
-		    }
-		    handle {
-		        import proxy {args[0]}
-		    }
-		}
-
-		import $DEPLOY_ROOT/*/caddy.conf
-		CADDY
+		write_global_caddyfile "$DEPLOY_ROOT/.internal/Caddyfile" "$acme_email"
 		log "📝 Created Caddyfile"
 	fi
 
 	# --- Create Caddy systemd service ---
-	cat > "$DEPLOY_ROOT/.internal/caddy.service" <<-SERVICE
-	[Unit]
-	Description=Caddy
-	After=network.target
-
-	[Service]
-	Type=notify
-	User=root
-	ExecStart=/usr/local/bin/caddy run --config $DEPLOY_ROOT/.internal/Caddyfile
-	ExecReload=/usr/local/bin/caddy reload --config $DEPLOY_ROOT/.internal/Caddyfile
-	Restart=on-failure
-
-	[Install]
-	WantedBy=multi-user.target
-	SERVICE
+	write_caddy_service "$DEPLOY_ROOT/.internal/caddy.service"
 
 	systemctl enable "$DEPLOY_ROOT/.internal/caddy.service" && systemctl start caddy
 
@@ -397,10 +457,9 @@ cmd_init() {
 }
 
 # Create a new app and its bare git repo
-cmd_create() {
-	escalate create "$@"
-	require_arg "${1:-}" "Usage: deploy create <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+apps:create() {
+	require_arg "${2:-}" "Usage: deploy create <app-name>"
+	local app_name=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
@@ -424,8 +483,7 @@ cmd_create() {
 	log "See 'deploy help' for deploy.conf format."
 }
 
-# List all apps (no privileges needed)
-cmd_list() {
+apps:list() {
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		[ -d "$app_dir" ] || continue
 		[[ "$(basename "$app_dir")" == .* ]] && continue
@@ -433,10 +491,9 @@ cmd_list() {
 	done
 }
 
-# Show detailed info about an app (no privileges needed)
-cmd_info() {
-	require_arg "${1:-}" "Usage: deploy info <app-name>"
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+apps:info() {
+	require_arg "${2:-}" "Usage: deploy info <app-name>"
+	local app_name=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local deploy_conf="$app_dir/current/deploy.conf"
@@ -577,12 +634,18 @@ plugin_run_logs() {
 PLUGIN_SUMMARY_domains="Manage domains for an app"
 
 # Manage domains for an app
-plugin_run_domains() { plugin_dispatch "list add remove" "$@"; }
+plugin_run_domains() {
+	subcmd list   "<app-name>"          "List domains for an app"
+	subcmd add    "<app-name> <domain>" "Add a domain"
+	subcmd remove "<app-name> <domain>" "Remove a domain"
+	dispatch "$@"
+}
 
 domains:list() {
 	require_app "${2:-}"
 	get_conf_all "$server_conf" "domain"
 }
+
 domains:add() {
 	require_app "${2:-}"
 	local domain=${3:-}
@@ -593,6 +656,7 @@ domains:add() {
 	success "Added domain $domain to $app_name"
 	reconfigure "$app_name"
 }
+
 domains:remove() {
 	require_app "${2:-}"
 	local domain=${3:-}
@@ -608,7 +672,12 @@ domains:remove() {
 PLUGIN_SUMMARY_env="Manage environment variables for an app"
 
 # Manage environment variables for an app
-plugin_run_env() { plugin_dispatch "list set remove" "$@"; }
+plugin_run_env() {
+	subcmd list   "<app-name>"           "List environment variables"
+	subcmd set    "<app-name> KEY=value" "Set an environment variable"
+	subcmd remove "<app-name> KEY"       "Remove an environment variable"
+	dispatch "$@"
+}
 
 env:list() {
 	require_app "${2:-}"
@@ -643,23 +712,18 @@ PLUGIN_SUMMARY_apps="Manage apps (create, list, info, restart, rollback, remove)
 
 # App management namespace
 plugin_run_apps() {
-	case "${1:-help}" in
-		help|--help|-h) plugin_help_apps ;;
-		list)           cmd_list ;;
-		create)         shift; cmd_create "$@" ;;
-		info)           shift; cmd_info "$@" ;;
-		restart)        shift; cmd_restart "$@" ;;
-		rollback)       shift; cmd_rollback "$@" ;;
-		remove)         shift; cmd_remove "$@" ;;
-		*)              die "Unknown apps command: $1" ;;
-	esac
+	subcmd list     ""             "List all apps"
+	subcmd create   "<name>"       "Create a new app"
+	subcmd info     "<name>"       "Show app status and configuration"
+	subcmd restart  "<name>"       "Restart an app's container"
+	subcmd rollback "<name>"       "Roll back to a previous release"
+	subcmd remove   "<name> [-f]"  "Remove an app and all its files"
+	dispatch "$@"
 }
 
-# Restart an app's running container
-cmd_restart() {
-	escalate restart "$@"
-	require_arg "${1:-}" "Usage: deploy restart <app-name>"
-	local app_name=$1
+apps:restart() {
+	require_arg "${2:-}" "Usage: deploy restart <app-name>"
+	local app_name=$2
 	local release_id; release_id=$(get_active_release "$app_name") || die "No active release"
 	log "🔄 Restarting $app_name..."
 	if systemctl restart "deploy-${app_name}--${release_id}"; then
@@ -669,11 +733,9 @@ cmd_restart() {
 	fi
 }
 
-# Roll back to a previous release
-cmd_rollback() {
-	escalate rollback "$@"
-	require_arg "${1:-}" "Usage: deploy rollback <app-name> [--release <id>]"
-	local app_name=$1; shift; local app_dir="$DEPLOY_ROOT/$app_name"
+apps:rollback() {
+	require_arg "${2:-}" "Usage: deploy rollback <app-name> [--release <id>]"
+	local app_name=$2; shift 2; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 
 	local current_release; current_release=$(readlink "$app_dir/current" 2>/dev/null)
@@ -711,12 +773,10 @@ cmd_rollback() {
 	activate_release "$app_name" "$new_release"
 }
 
-# Remove an app and all its files
-cmd_remove() {
-	escalate remove "$@"
-	require_arg "${1:-}" "Usage: deploy remove <app-name> [-f]"
-	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
-	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+apps:remove() {
+	require_arg "${2:-}" "Usage: deploy remove <app-name> [-f]"
+	local force=false; [[ "${3:-}" == "-f" || "${3:-}" == "--force" ]] && force=true
+	local app_name=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [ ! -d "$app_dir" ]; then die "App $app_name does not exist"; fi
 	if ! $force; then
 		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
@@ -820,7 +880,7 @@ cmd_deploy_app() {
 	_DEPLOY_STATUS_FILE=""
 }
 
-# Internal: generate Caddy config, systemd service, and start.sh for a release
+# Internal: generate Caddy config and systemd service for a release
 cmd_configure() {
 	require_arg "${1:-}" "Internal error: app name required"
 	require_arg "${2:-}" "Internal error: release id required"
@@ -859,21 +919,12 @@ cmd_configure() {
 			headers+="    header $path $name $value"$'\n'
 		done < <(get_conf_all "$deploy_conf" "header")
 
-		cat > "$app_dir/caddy.conf" <<-CADDY
-		$domains {
-		    root * $app_dir/current${static_dir:+/$static_dir}
-		    log_append release $release_id
-		    $headers
-		    $handler
-				import logging "$app_dir"
-		}
-		CADDY
-		caddy fmt "$app_dir/caddy.conf" --overwrite
+		write_app_caddy_conf "$app_dir/caddy.conf" "$domains" "$app_dir" "$release_id" "$static_dir" "$headers" "$handler"
 	else
 		true > "$app_dir/caddy.conf"
 	fi
 
-	# --- Generate systemd service unit and start.sh ---
+	# --- Generate systemd service unit ---
 	if [ -n "$start_cmd" ]; then
 		local svc="deploy-${app_name}--${release_id}"
 
@@ -908,36 +959,10 @@ cmd_configure() {
 			[ ! -e "$host_path" ] && { error "Host path does not exist: $host_path (creating directory)"; mkdir -p "$host_path"; }
 		done < <(get_conf_all "$server_conf" "mount")
 
-		nspawn_args+=(/app/start.sh)
+		nspawn_args+=(bash -c "$start_cmd")
 
-		# Format nspawn args into the service file, one per line with \ continuation
 		mkdir -p "$app_dir/data"
-		{
-			cat <<-SERVICE
-			[Unit]
-			Description=deploy $app_name $release_id
-			After=network.target
-
-			[Service]
-			Type=simple
-			SERVICE
-			printf 'ExecStart=/usr/bin/systemd-nspawn \\\n'
-			local i
-			for ((i = 0; i < ${#nspawn_args[@]} - 1; i++)); do
-				printf '    %s \\\n' "${nspawn_args[i]}"
-			done
-			printf '    %s\n' "${nspawn_args[-1]}"
-			cat <<-SERVICE
-			Restart=on-failure
-			KillMode=mixed
-			SERVICE
-		} > "$release_dir/${svc}.service"
-
-		cat > "$release_dir/start.sh" <<-STARTSH
-		#!/bin/bash
-		exec $start_cmd
-		STARTSH
-		chmod +x "$release_dir/start.sh"
+		write_app_service "$release_dir/${svc}.service" "$app_name" "$release_id" "${nspawn_args[@]}"
 	fi
 
 	success "Configured"
@@ -983,7 +1008,7 @@ cmd_help() {
 	Commands:
 	HELP
 
-	# Inline plugins
+	# inline plugins
 	local fn
 	for fn in $(declare -F | awk '/plugin_run_/{print $3}' | sort); do
 		local name="${fn#plugin_run_}"
@@ -1025,42 +1050,6 @@ cmd_help() {
 	HELP
 }
 
-plugin_help_apps() {
-	cat <<-HELP
-	Usage: deploy apps <command> [args...]
-
-	Commands:
-	  list                List all apps
-	  create <name>       Create a new app
-	  info <name>         Show app status and configuration
-	  restart <name>      Restart an app's container
-	  rollback <name>     Roll back to a previous release
-	  remove <name> [-f]  Remove an app and all its files
-	HELP
-}
-
-plugin_help_domains() {
-	cat <<-HELP
-	Usage: deploy domains <command> <app-name> [args...]
-
-	Commands:
-	  list <name>              List domains for an app
-	  add <name> <domain>      Add a domain to an app
-	  remove <name> <domain>   Remove a domain from an app
-	HELP
-}
-
-plugin_help_env() {
-	cat <<-HELP
-	Usage: deploy env <command> <app-name> [args...]
-
-	Commands:
-	  list <name>              List environment variables for an app
-	  set <name> KEY=value     Set an environment variable
-	  remove <name> KEY        Remove an environment variable
-	HELP
-}
-
 plugin_help_logs() {
 	cat <<-HELP
 	Usage: deploy logs <app-name> [app|build|access] [options...]
@@ -1080,25 +1069,18 @@ plugin_help_logs() {
 	HELP
 }
 
-
-
 case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
 	init)           cmd_init ;;
 	uninstall)      shift; cmd_uninstall "$@" ;;
 
-	# Shortcuts → delegate to apps plugin
-	create)         shift; load_plugin apps create "$@" ;;
-	list)           load_plugin apps list ;;
-	info)           shift; load_plugin apps info "$@" ;;
-	restart)        shift; load_plugin apps restart "$@" ;;
-	rollback)       shift; load_plugin apps rollback "$@" ;;
-	remove)         shift; load_plugin apps remove "$@" ;;
+	# shortcuts → delegate to apps plugin
+	create|list|info|restart|rollback|remove) load_plugin apps "$@" ;;
 
-	# Internal (git hooks, other commands)
+	# internal (git hooks, other commands)
 	_deploy-app)    shift; cmd_deploy_app "$@" ;;
 	_configure)     shift; cmd_configure "$@" ;;
 
-	# Try as plugin
+	# try as plugin
 	*)              load_plugin "$@" ;;
 esac

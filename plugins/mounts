@@ -3,7 +3,9 @@
 
 PLUGIN_SUMMARY="Manage bind mounts for an app"
 
-plugin_run() { plugin_dispatch "list add remove" "$@"; }
+subcmd list   "<app-name>"                          "List bind mounts for an app"
+subcmd add    "<app-name> <host>:<container>"        "Add a bind mount"
+subcmd remove "<app-name> <host>:<container>"        "Remove a bind mount"
 
 mounts:list() {
 	require_app "${2:-}"
@@ -38,13 +40,3 @@ mounts:remove() {
 	reconfigure "$app_name"
 }
 
-plugin_help() {
-	cat <<-HELP
-	Usage: deploy mounts <command> <app-name> [args...]
-
-	Commands:
-	  list <name>                                   List bind mounts for an app
-	  add <name> <host>:<container> [--readonly]    Add a bind mount
-	  remove <name> <host>:<container>              Remove a bind mount
-	HELP
-}

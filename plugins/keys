@@ -3,11 +3,14 @@
 
 PLUGIN_SUMMARY="Manage SSH deploy keys for an app"
 
+subcmd list     "<app-name>"                "List deploy keys for an app"
+subcmd add      "<app-name> <key> [pubkey]" "Add a restricted deploy key"
+subcmd remove   "<app-name> <key>"          "Remove a deploy key by name"
+subcmd generate "<app-name> <key>"          "Generate a new key pair"
+
 _key_fingerprint() {
 	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
 }
-
-plugin_run() { plugin_dispatch "list add remove generate" "$@"; }
 
 keys:list() {
 	require_app "${2:-}"
@@ -81,16 +84,4 @@ keys:generate() {
 	log "" >&2
 	cat "$keyfile"
 	rm -rf "$tmpdir"
-}
-
-plugin_help() {
-	cat <<-HELP
-	Usage: deploy keys <command> <app> [args...]
-
-	Commands:
-	  list <app>                     List deploy keys for an app
-	  add <app> <key> [pubkey]  Add a restricted deploy key
-	  remove <app> <key>        Remove a deploy key by name
-	  generate <app> <key>      Generate a new key pair (prints private key)
-	HELP
 }
