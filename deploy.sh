@@ -22,15 +22,13 @@ PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
 
 red() { printf "\033[31m$1\033[0m"; }
 green() { printf "\033[32m$1\033[0m"; }
+dim() { printf "\033[2m$1\033[0m"; }
 
-# Print an error and exit
-die() { error "$1" >&2; exit 1; }
-
-log() { echo "$@" >&2; } # print to stderr
-step() { log "$(dim "→") $@"; } # print a success message
+log() { echo "$@" >&2; }              # print to stderr
+step() { log "$(dim "→") $@"; }      # print a progress step
 success() { log "$(green "✓") $@"; } # print a success message
-error() { log "$(red "✗") $@"; } # print an error message
-die() { log "$1"; exit 1; } # print an error and exit
+error() { log "$(red "✗") $@"; }     # print an error message
+die() { error "$1"; exit 1; }        # print an error and exit
 
 require_arg() { [ -n "${1:-}" ] || die "$2"; }
 
@@ -149,7 +147,6 @@ wait_for_port() {
 	done
 }
 
-
 load_plugin() {
 	local cmd="$1"; shift
 	PLUGIN_NAME="$cmd"
@@ -227,12 +224,10 @@ write_app_caddy_conf() {
 	caddy fmt "$dest" --overwrite
 }
 
-
-
 # Initialize the deployment system (must be run as root)
 cmd_init() {
 	if [ "$(id -u)" -ne 0 ]; then die "deploy init must be run as root"; fi
-	log "🚀 Setting up deploy.sh at $DEPLOY_ROOT..."
+	step "Setting up deploy.sh at $DEPLOY_ROOT..."
 
 	# install system dependencies (including caddy from its official repo)
 	if command -v apt-get &>/dev/null; then
@@ -277,7 +272,7 @@ cmd_init() {
 
 	# pull Alpine base image
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
-		log "📦 Pulling Alpine base image..."
+		step "Pulling Alpine base image..."
 		local arch; arch=$(uname -m)
 		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
 		if [ -z "$alpine_file" ]; then die "Could not find Alpine minirootfs for $arch"; fi
@@ -292,7 +287,7 @@ cmd_init() {
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
 		write_global_caddyfile "$DEPLOY_ROOT/.internal/Caddyfile" "$acme_email"
-		log "📝 Created Caddyfile"
+		success "Created Caddyfile"
 	fi
 
 	# --- create Caddy systemd service ---
@@ -330,7 +325,7 @@ cmd_init() {
 	ALL ALL=(deploy) NOPASSWD: /usr/local/bin/deploy *
 	SUDOERS
 	chmod 0440 /etc/sudoers.d/deploy
-	log "📝 Created /etc/sudoers.d/deploy"
+	success "Created /etc/sudoers.d/deploy"
 
 	log ""
 	success "System initialized!"
@@ -346,7 +341,7 @@ apps:create() {
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
-	log "📦 Creating app: $app_name"
+	step "Creating app: $app_name"
 	mkdir -p "$app_dir"/repo.git
 	git init --bare --initial-branch=main "$app_dir/repo.git"
 
@@ -573,7 +568,6 @@ env:remove() {
 	reconfigure "$app_name"
 }
 
-
 PLUGIN_SUMMARY_apps="Manage apps"
 
 # App management namespace
@@ -590,7 +584,7 @@ plugin_run_apps() {
 apps:restart() {
 	require_app "${2:-}"; local app_name=$2
 	local slot; slot=$(cat "$app_dir/active" 2>/dev/null) || die "No active slot"
-	log "🔄 Restarting $app_name..."
+	step "Restarting $app_name..."
 	systemctl restart "deploy@deploy-${app_name}--${slot}" || die "Failed to restart $app_name"
 	success "Restarted"
 }
@@ -621,15 +615,15 @@ apps:remove() {
 		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
 		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 	fi
-	log "🗑️  Removing app: $app_name"
+	step "Removing $app_name..."
 	teardown_slot "$app_name" "blue"
 	teardown_slot "$app_name" "green"
 	systemctl daemon-reload
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
-	log "  Removing app files..."
+	step "Removing app files..."
 	rm -rf "$app_dir"
-	log "  Reloading Caddy..."
+	step "Reloading Caddy..."
 	systemctl reload caddy 2>/dev/null || true
 	success "Removed $app_name"
 }
@@ -652,7 +646,7 @@ cmd_deploy_app() {
 	_DEPLOY_STATUS_FILE="$status_file"; _DEPLOY_START_TIME="$start_time"
 	trap '_deploy_exit_trap' EXIT
 
-	log "📦 Deploying $app_name..."
+	step "Deploying $app_name..."
 	rm -rf "$release_dir"
 	local repo_dir; repo_dir=$(pwd)
 	unset GIT_DIR
@@ -662,14 +656,13 @@ cmd_deploy_app() {
 	# the dir is mounted at /build inside the build container.
 	git clone --local --quiet "$repo_dir" "$release_dir"
 	if [ -f "$release_dir/.gitmodules" ]; then
-		log "📦 Initializing submodules..."
+		step "Initializing submodules..."
 		GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$release_dir" submodule update --init --recursive
 	fi
 
 	local deploy_conf="$release_dir/deploy.conf"
 	local start_cmd; start_cmd=$(get_conf "$deploy_conf" "start")
 	local build_cmd; build_cmd=$(get_conf "$deploy_conf" "build")
-
 
 	local setenv_args=()
 	while IFS= read -r env_var; do
@@ -684,11 +677,11 @@ cmd_deploy_app() {
 		local build_dir="$app_dir/machine-build"
 		rm -rf "$build_dir"
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
-		log "🔧 Running build..."
+		step "Running build..."
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd" 2>&1 | tee "$build_log"
 		[ -n "$start_cmd" ] && mv "$build_dir" "$release_dir/machine" || rm -rf "$build_dir"
 	elif [ -n "$start_cmd" ]; then
-		log "🏗️  Cloning base image..."
+		step "Cloning base image..."
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$release_dir/machine"
 	fi
 
@@ -732,7 +725,7 @@ cmd_configure() {
 	local d; for d in $domains; do check_domain_collision "$d" "$app_name"; done
 	local port; port=$(assign_port "$app_name" "$slot")
 
-	log "🔄 Configuring $app_name..."
+	step "Configuring $app_name..."
 
 	local static_dir; static_dir=$(get_conf "$deploy_conf" "assets")
 	local spa_mode; spa_mode=$(get_conf "$deploy_conf" "spa")
