@@ -85,17 +85,12 @@ _deploy_exit_trap() {
 
 check_domain_collision() {
 	local domain=$1 exclude_app=${2:-}
-
-	local server_conf
-	for server_conf in "$DEPLOY_ROOT"/*/server.conf; do
-		if [ ! -f "$server_conf" ]; then continue; fi
-		local app_name; app_name=$(basename "$(dirname "$server_conf")")
-		if [ "$app_name" = "$exclude_app" ]; then continue; fi
-
-		local existing_domain
-		while IFS= read -r existing_domain; do
-			if [ "$existing_domain" = "$domain" ]; then die "Domain $domain already used by $app_name"; fi
-		done < <(get_conf_all "$server_conf" "domain")
+	local conf
+	for conf in "$DEPLOY_ROOT"/*/server.conf; do
+		[ -f "$conf" ] || continue
+		local app_name; app_name=$(basename "$(dirname "$conf")")
+		[ "$app_name" = "$exclude_app" ] && continue
+		grep -qx "domain=$domain" "$conf" 2>/dev/null && die "Domain $domain already used by $app_name"
 	done
 }
 
@@ -158,21 +153,18 @@ reconfigure() {
 # Append key=value to a config file
 conf_add() { echo "$2=$3" >> "$1"; }
 
-# Remove the line matching exactly key=value
-conf_remove_value() {
-	local file=$1 key=$2 value=$3
+_conf_remove() {
+	local file=$1 pattern=$2
 	local tmp; tmp=$(mktemp)
-	grep -v "^${key}=${value}$" "$file" > "$tmp" || true
+	grep -v "$pattern" "$file" > "$tmp" || true
 	mv "$tmp" "$file"
 }
 
+# Remove the line matching exactly key=value
+conf_remove_value() { _conf_remove "$1" "^${2}=${3}$"; }
+
 # Remove all lines matching key=*
-conf_remove_key() {
-	local file=$1 key=$2
-	local tmp; tmp=$(mktemp)
-	grep -v "^${key}=" "$file" > "$tmp" || true
-	mv "$tmp" "$file"
-}
+conf_remove_key() { _conf_remove "$1" "^${2}="; }
 
 teardown_release() {
 	local app_name=$1 release_id=$2
@@ -210,18 +202,13 @@ activate_release() {
 			die "New instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
 		fi
 
-		ln -sfn "releases/$release_id" "$app_dir/current"
-		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
-
-		# Teardown old
 		if [ -n "$old_release" ] && [ "$old_release" != "$release_id" ]; then
 			teardown_release "$app_name" "$old_release"
 		fi
-	else
-		# Static app: atomic symlink swap
-		ln -sfn "releases/$release_id" "$app_dir/current"
-		caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 	fi
+
+	ln -sfn "releases/$release_id" "$app_dir/current"
+	caddy reload --config "$DEPLOY_ROOT/.internal/Caddyfile" 2>/dev/null || true
 }
 
 load_plugin() {
@@ -726,11 +713,8 @@ apps:restart() {
 	local app_name=$2
 	local release_id; release_id=$(get_active_release "$app_name") || die "No active release"
 	log "🔄 Restarting $app_name..."
-	if systemctl restart "deploy-${app_name}--${release_id}"; then
-		success "Restarted"
-	else
-		die "Failed to restart $app_name"
-	fi
+	systemctl restart "deploy-${app_name}--${release_id}" || die "Failed to restart $app_name"
+	success "Restarted"
 }
 
 apps:rollback() {
@@ -947,12 +931,10 @@ cmd_configure() {
 		)
 
 		while IFS= read -r mount; do
-			if [[ "$mount" =~ ^([^:]+):([^:]+):ro$ ]]; then
+			if [[ "$mount" =~ ^([^:]+):([^:]+)(:ro)?$ ]]; then
 				local host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
-				nspawn_args+=("--bind-ro=$host_path:$container_path")
-			elif [[ "$mount" =~ ^([^:]+):([^:]+)$ ]]; then
-				local host_path="${BASH_REMATCH[1]}" container_path="${BASH_REMATCH[2]}"
-				nspawn_args+=("--bind=$host_path:$container_path")
+				local flag="--bind${BASH_REMATCH[3]:+-ro}"
+				nspawn_args+=("$flag=$host_path:$container_path")
 			else
 				error "Skipping invalid mount: $mount"; continue
 			fi
