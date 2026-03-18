@@ -14,7 +14,6 @@ set -euo pipefail
 
 DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
-PLUGIN_DIR="$DEPLOY_ROOT/.plugins"
 PORT_RANGE_START=49152   # first ephemeral port
 PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
 
@@ -33,33 +32,9 @@ die() { error "$1"; exit 1; }        # print an error and exit
 require_arg() { [ -n "${1:-}" ] || die "$2"; }
 
 require_app() {
-	require_arg "${1:-}" "Usage: deploy $PLUGIN_NAME <subcmd> <app>"
+	require_arg "${1:-}" "Usage: deploy <command> <app>"
 	[ -d "$DEPLOY_ROOT/$1" ] || die "App $1 does not exist"
 	app_name="$1"; app_dir="$DEPLOY_ROOT/$1"
-}
-
-# register a subcommand: name | usage | description
-subcmd() { SUBCMDS_DATA="${SUBCMDS_DATA}${1}|${2}|${3}"$'\n'; }
-
-# validate subcmd, escalate, then call <plugin>:<subcmd> "$@"
-dispatch() {
-	local subcmd="${1:-}"
-	if [[ "$subcmd" == --help || "$subcmd" == -h || "$subcmd" == help || -z "$subcmd" ]]; then
-		plugin_help_default; return
-	fi
-	local valid; valid=$(printf '%s' "$SUBCMDS_DATA" | cut -d'|' -f1 | tr '\n' ' ')
-	[[ " $valid " == *" $subcmd "* ]] || die "Unknown $PLUGIN_NAME command: $subcmd. Run \"deploy $PLUGIN_NAME --help\" for usage"
-	escalate "$PLUGIN_NAME" "$@"
-	"${PLUGIN_NAME}:${subcmd}" "$@"
-}
-
-# Auto-generate help from subcmd registrations
-plugin_help_default() {
-	printf 'Usage: deploy %s <command> [args...]\n\nCommands:\n' "$PLUGIN_NAME"
-	while IFS='|' read -r name usage desc; do
-		[ -z "$name" ] && continue
-		printf '  %-10s  %-28s  %s\n' "$name" "$usage" "$desc"
-	done <<< "$SUBCMDS_DATA"
 }
 
 # Privilege escalation: non-deploy users hop to the deploy user first (any user
@@ -108,13 +83,6 @@ active_slot() { cat "$DEPLOY_ROOT/$1/active" 2>/dev/null || true; }
 
 # systemd unit for an app slot
 app_unit() { echo "deploy@$(systemd-escape -p "/${1}/${2}")"; }
-
-# pipe to pager unless following output (-f) or user passed --no-pager
-pager() {
-	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
-}
-
-# --- config files ---
 
 # --- lifecycle ---
 
@@ -175,22 +143,207 @@ cmd_apply() {
 	reload_caddy
 }
 
-load_plugin() {
-	local cmd="$1"; shift
-	PLUGIN_NAME="$cmd"
-	SUBCMDS_DATA=""
+cmd_create() {
+	escalate create "$@"
+	require_arg "${1:-}" "Usage: deploy create <app>"
+	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
+	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
+	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
 
-	local plugin_file="$PLUGIN_DIR/$cmd"
-	[ -f "$plugin_file" ] && source "$plugin_file"
+	step "Creating app: $app_name"
+	mkdir -p "$app_dir"/repo.git
+	git init --bare --initial-branch=main "$app_dir/repo.git"
 
-	if declare -f "plugin:${cmd}" > /dev/null 2>&1; then
-		"plugin:${cmd}" "$@"
-	else
-		die "Unknown command: $cmd. Run \"deploy help\" for usage"
-	fi
+	cat > "$app_dir/repo.git/hooks/post-receive" <<-HOOK
+	#!/bin/bash
+	sudo /usr/local/bin/deploy _deploy-app $app_name
+	HOOK
+	chmod +x "$app_dir/repo.git/hooks/post-receive"
+	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
+	chmod 2775 "$app_dir"
+	touch "$app_dir/domains" "$app_dir/env"
+	chmod 664 "$app_dir/domains" "$app_dir/env"
+
+	success "Created app: $app_name"
+	log ""
+	log "Next steps:"
+	log "  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git"
+	log "  git push deploy main"
+	log ""
 }
 
-# --- subcommands ---
+cmd_list() {
+	escalate list
+	for app_dir in "$DEPLOY_ROOT"/*/; do
+		[ -d "$app_dir" ] || continue
+		[[ "$(basename "$app_dir")" == .* ]] && continue
+		printf '%s\n' "$(basename "$app_dir")"
+	done
+}
+
+cmd_info() {
+	escalate info "$@"
+	require_app "${1:-}"; local app_name=$1
+	local slot; slot=$(active_slot "$app_name")
+	local deploy_conf="$app_dir/$slot/deploy.conf"
+
+	local start_cmd="" status="" assets="" spa=""
+	if [ -f "$deploy_conf" ]; then
+		start_cmd=$(get_conf "$deploy_conf" "start")
+		if [ -n "$start_cmd" ] && [ -n "$slot" ]; then
+			status=$(systemctl is-active "$(app_unit "$app_name" "$slot")" 2>/dev/null || true)
+		fi
+		assets=$(get_conf "$deploy_conf" "assets")
+		spa=$(get_conf "$deploy_conf" "spa")
+	fi
+	local domains_list; domains_list=$(cat "$app_dir/domains" 2>/dev/null || true)
+
+	echo -e "\e[1m$app_name\e[0m"
+	if [ ! -f "$deploy_conf" ]; then echo "┆ Not yet deployed"; return; fi
+	if [ -n "$start_cmd" ]; then
+		echo "┆ Type:    container ($status)"
+		echo "┆ Command: $start_cmd"
+	else
+		echo "┆ Type:    static"
+	fi
+	[ -n "$domains_list" ] && echo "┆ Domain:  $(echo "$domains_list" | tr '\n' ' ')"
+	[ -n "$assets" ] && echo "┆ Assets:  $assets"
+	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
+}
+
+cmd_restart() {
+	escalate restart "$@"
+	require_app "${1:-}"; local app_name=$1
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
+	step "Restarting $app_name..."
+	systemctl restart "$(app_unit "$app_name" "$slot")" || die "Failed to restart $app_name"
+	success "Restarted"
+}
+
+cmd_rollback() {
+	escalate rollback "$@"
+	require_app "${1:-}"; local app_name=$1
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "Nothing deployed"
+	local prev_slot; prev_slot=$(other_slot "$slot")
+	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
+
+	activate_slot "$app_name" "$prev_slot"
+	success "Rolled back $app_name"
+}
+
+cmd_remove() {
+	escalate remove "$@"
+	require_app "${1:-}"; local app_name=$1
+	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
+	if ! $force; then
+		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
+		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	fi
+	step "Removing $app_name..."
+	teardown_slot "$app_name" "blue"
+	teardown_slot "$app_name" "green"
+	systemctl daemon-reload
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
+	step "Removing app files..."
+	rm -rf "$app_dir"
+	reload_caddy
+	success "Removed $app_name"
+}
+
+cmd_domains() {
+	escalate domains "$@"
+	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	case "$subcmd" in
+		list)   domains_list "$@" ;;
+		add)    domains_add "$@" ;;
+		remove) domains_remove "$@" ;;
+		*)      die "Usage: deploy domains [list|add|remove] <app> [domain]" ;;
+	esac
+}
+
+domains_list() {
+	require_app "${1:-}"
+	cat "$app_dir/domains" 2>/dev/null || true
+}
+
+domains_add() {
+	require_app "${1:-}"
+	local domain=${2:-}
+	require_arg "$domain" "Usage: deploy domains add <app> <domain>"
+	check_domain_collision "$domain" "$app_name"
+	echo "$domain" >> "$app_dir/domains"
+	cmd_apply "$app_name"
+	success "Added domain $domain"
+}
+
+domains_remove() {
+	require_app "${1:-}"
+	local domain=${2:-}
+	require_arg "$domain" "Usage: deploy domains remove <app> <domain>"
+	sed -i "/^${domain}$/d" "$app_dir/domains"
+	cmd_apply "$app_name"
+	success "Removed domain $domain"
+}
+
+cmd_env() {
+	escalate env "$@"
+	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	case "$subcmd" in
+		list)   env_list "$@" ;;
+		set)    env_set "$@" ;;
+		remove) env_remove "$@" ;;
+		*)      die "Usage: deploy env [list|set|remove] <app> [KEY=value]" ;;
+	esac
+}
+
+env_list() {
+	require_app "${1:-}"
+	cat "$app_dir/env" 2>/dev/null || true
+}
+
+env_set() {
+	require_app "${1:-}"
+	local kv=${2:-}
+	require_arg "$kv" "Usage: deploy env set <app> KEY=value"
+	[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
+	local key="${kv%%=*}"
+	sed -i "/^${key}=/d" "$app_dir/env"
+	echo "$kv" >> "$app_dir/env"
+	cmd_apply "$app_name"
+	success "Set $key"
+}
+
+env_remove() {
+	require_app "${1:-}"
+	local key=${2:-}
+	require_arg "$key" "Usage: deploy env remove <app> KEY"
+	sed -i "/^${key}=/d" "$app_dir/env"
+	cmd_apply "$app_name"
+	success "Removed $key"
+}
+
+cmd_logs() {
+	escalate logs "$@"
+	require_arg "${1:-}" "Usage: deploy logs <app> [-f] [-n N]"
+	local app_name=$1; shift
+	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
+
+	local follow=false num=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-f|--follow) follow=true ;;
+			-n)          shift; num=$1 ;;
+			*)           die "Unknown option: $1" ;;
+		esac
+		shift
+	done
+
+	local args=(--no-pager -u "deploy@$(systemd-escape -p "/${app_name}")-*")
+	$follow       && args+=(-f)
+	[ -n "$num" ] && args+=(-n "$num")
+	journalctl "${args[@]}"
+}
 
 # initialize the deployment system
 cmd_init() {
@@ -206,13 +359,13 @@ cmd_init() {
 			| tee /etc/apt/sources.list.d/caddy-stable.list
 		chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
 		apt-get update -q
-		apt-get install -y caddy systemd-container jq
+		apt-get install -y caddy systemd-container
 	elif command -v dnf &>/dev/null; then
 		dnf install -y dnf5-plugins
 		dnf copr enable -y @caddy/caddy
-		dnf install -y caddy systemd-container jq
+		dnf install -y caddy systemd-container
 	else
-		die "Unsupported package manager — install caddy, systemd-container, and jq manually"
+		die "Unsupported package manager — install caddy and systemd-container manually"
 	fi
 
 	# create deploy user
@@ -234,8 +387,8 @@ cmd_init() {
 		success "Copied SSH authorized_keys from $src_keys"
 	fi
 
-	# create deploy directory — group-writable so deploy group members can script against files directly
-	mkdir -p "$DEPLOY_ROOT/.internal" "$PLUGIN_DIR"
+	# create deploy directory
+	mkdir -p "$DEPLOY_ROOT/.internal"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 	chmod 2775 "$DEPLOY_ROOT"
 
@@ -259,30 +412,25 @@ cmd_init() {
 		{
 		    email $acme_email
 		}
-
 		(logging) {
 		    log {
 		        output file {args[0]}/access.log
 		        format json
 		    }
 		}
-
 		(static) {
 		    file_server
 		    encode gzip
 		}
-
 		(proxy) {
 		    reverse_proxy localhost:{args[0]} {
 		        header_up Host {http.request.host}
 		    }
 		}
-
 		(spa) {
 		    try_files {path} /index.html
 		    import static
 		}
-
 		(assets) {
 		    @static file
 		    handle @static {
@@ -336,265 +484,6 @@ cmd_init() {
 	success "Created /etc/sudoers.d/deploy"
 
 	success "deploy.sh initialized"
-}
-
-# --- apps plugin ---
-
-PLUGIN_SUMMARY_apps="Manage apps"
-
-plugin:apps() {
-	subcmd create   "<name>"       "Create a new app"
-	subcmd list     ""             "List all apps"
-	subcmd info     "<name>"       "Show app status and configuration"
-	subcmd restart  "<name>"       "Restart an app's container"
-	subcmd rollback "<name>"       "Roll back to a previous release"
-	subcmd remove   "<name> [-f]"  "Remove an app and all its files"
-	dispatch "$@"
-}
-
-apps:create() {
-	require_arg "${2:-}" "Usage: deploy create <app>"
-	local app_name=$2; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
-	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
-
-	step "Creating app: $app_name"
-	mkdir -p "$app_dir"/repo.git
-	git init --bare --initial-branch=main "$app_dir/repo.git"
-
-	cat > "$app_dir/repo.git/hooks/post-receive" <<-HOOK
-	#!/bin/bash
-	sudo /usr/local/bin/deploy _deploy-app $app_name
-	HOOK
-	chmod +x "$app_dir/repo.git/hooks/post-receive"
-	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
-	chmod 2775 "$app_dir"
-	touch "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
-	chmod 664 "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
-
-	success "Created app: $app_name"
-	log ""
-	log "Next steps:"
-	log "  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git"
-	log "  git push deploy main"
-	log ""
-}
-
-apps:list() {
-	for app_dir in "$DEPLOY_ROOT"/*/; do
-		[ -d "$app_dir" ] || continue
-		[[ "$(basename "$app_dir")" == .* ]] && continue
-		printf '%s\n' "$(basename "$app_dir")"
-	done
-}
-
-apps:info() {
-	require_app "${2:-}"; local app_name=$2
-	local slot; slot=$(active_slot "$app_name")
-	local deploy_conf="$app_dir/$slot/deploy.conf"
-
-	local start_cmd="" status="" assets="" spa=""
-	if [ -f "$deploy_conf" ]; then
-		start_cmd=$(get_conf "$deploy_conf" "start")
-		if [ -n "$start_cmd" ] && [ -n "$slot" ]; then
-			status=$(systemctl is-active "$(app_unit "$app_name" "$slot")" 2>/dev/null || true)
-		fi
-		assets=$(get_conf "$deploy_conf" "assets")
-		spa=$(get_conf "$deploy_conf" "spa")
-	fi
-	local domains_list; domains_list=$(cat "$app_dir/domains" 2>/dev/null || true)
-
-	echo -e "\e[1m$app_name\e[0m"
-	if [ ! -f "$deploy_conf" ]; then echo "┆ Not yet deployed"; return; fi
-	if [ -n "$start_cmd" ]; then
-		echo "┆ Type:    container ($status)"
-		echo "┆ Command: $start_cmd"
-	else
-		echo "┆ Type:    static"
-	fi
-	[ -n "$domains_list" ] && echo "┆ Domain:  $(echo "$domains_list" | tr '\n' ' ')"
-	[ -n "$assets" ] && echo "┆ Assets:  $assets"
-	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
-}
-
-apps:restart() {
-	require_app "${2:-}"; local app_name=$2
-	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
-	step "Restarting $app_name..."
-	systemctl restart "$(app_unit "$app_name" "$slot")" || die "Failed to restart $app_name"
-	success "Restarted"
-}
-
-apps:rollback() {
-	require_app "${2:-}"; local app_name=$2
-	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "Nothing deployed"
-	local prev_slot; prev_slot=$(other_slot "$slot")
-	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
-
-	activate_slot "$app_name" "$prev_slot"
-	success "Rolled back $app_name"
-}
-
-apps:remove() {
-	require_app "${2:-}"; local app_name=$2
-	local force=false; [[ "${3:-}" == "-f" || "${3:-}" == "--force" ]] && force=true
-	if ! $force; then
-		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
-		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
-	fi
-	step "Removing $app_name..."
-	teardown_slot "$app_name" "blue"
-	teardown_slot "$app_name" "green"
-	systemctl daemon-reload
-	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
-	step "Removing app files..."
-	rm -rf "$app_dir"
-	reload_caddy
-	success "Removed $app_name"
-}
-
-# --- domains plugin ---
-
-PLUGIN_SUMMARY_domains="Manage domains for an app"
-
-plugin:domains() {
-	subcmd list   "<app>"          "List domains for an app"
-	subcmd add    "<app> <domain>" "Add a domain"
-	subcmd remove "<app> <domain>" "Remove a domain"
-	dispatch "$@"
-}
-
-domains:list() {
-	require_app "${2:-}"
-	cat "$app_dir/domains" 2>/dev/null || true
-}
-
-domains:add() {
-	require_app "${2:-}"
-	local domain=${3:-}
-	require_arg "$domain" "Usage: deploy domains add <app> <domain>"
-	check_domain_collision "$domain" "$app_name"
-	echo "$domain" >> "$app_dir/domains"
-	cmd_apply "$app_name"
-	success "Added domain $domain"
-}
-
-domains:remove() {
-	require_app "${2:-}"
-	local domain=${3:-}
-	require_arg "$domain" "Usage: deploy domains remove <app> <domain>"
-	sed -i "/^${domain}$/d" "$app_dir/domains"
-	cmd_apply "$app_name"
-	success "Removed domain $domain"
-}
-
-# --- env plugin ---
-
-PLUGIN_SUMMARY_env="Manage environment variables for an app"
-
-plugin:env() {
-	subcmd list   "<app>"           "List environment variables"
-	subcmd set    "<app> KEY=value" "Set an environment variable"
-	subcmd remove "<app> KEY"       "Remove an environment variable"
-	dispatch "$@"
-}
-
-env:list() {
-	require_app "${2:-}"
-	cat "$app_dir/env" 2>/dev/null || true
-}
-
-env:set() {
-	require_app "${2:-}"
-	local kv=${3:-}
-	require_arg "$kv" "Usage: deploy env set <app> KEY=value"
-	[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
-	local key="${kv%%=*}"
-	# replace semantics: remove existing key then append
-	sed -i "/^${key}=/d" "$app_dir/env"
-	echo "$kv" >> "$app_dir/env"
-	cmd_apply "$app_name"
-	success "Set $key"
-}
-
-env:remove() {
-	require_app "${2:-}"
-	local key=${3:-}
-	require_arg "$key" "Usage: deploy env remove <app> KEY"
-	sed -i "/^${key}=/d" "$app_dir/env"
-	cmd_apply "$app_name"
-	success "Removed $key"
-}
-
-# --- logs plugin ---
-
-PLUGIN_SUMMARY_logs="View app, build, or access logs"
-
-plugin:logs() {
-	if [ -z "${1:-}" ] || [[ "${1:-}" == --help ]] || [[ "${1:-}" == -h ]]; then plugin_help_logs; return; fi
-	escalate logs "$@"
-	local app_name=$1; shift
-	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
-
-	local stream="app"
-	case "${1:-}" in app|build|access) stream=$1; shift ;; esac
-
-	# Options: -f and -n apply to all streams; --since/--before apply to app and access
-	local follow=false no_pager=false num="" since="" before=""
-	while [ $# -gt 0 ]; do
-		case "$1" in
-			-f|--follow) follow=true ;;
-			-n)          shift; num=$1 ;;
-			--since)     shift; since=$1 ;;
-			--before)    shift; before=$1 ;;
-			--no-pager)  no_pager=true ;;
-			*)           die "Unknown option: $1" ;;
-		esac
-		shift
-	done
-
-	case "$stream" in
-		# --- App logs: container stdout/stderr via journald ---
-		app)
-			local args=(--no-pager -u "deploy@$(systemd-escape -p "/${app_name}")-*")
-			$follow          && args+=(-f)
-			[ -n "$num" ]    && args+=(-n "$num")
-			[ -n "$since" ]  && args+=(--since "$since")
-			[ -n "$before" ] && args+=(--before "$before")
-			journalctl "${args[@]}" | pager "$follow" "$no_pager"
-			;;
-		# --- Build logs: saved output from the build step ---
-		build)
-			local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
-			local log_file="$DEPLOY_ROOT/$app_name/$slot/build.log"
-			if [ ! -f "$log_file" ]; then die "No build log found for $app_name"; fi
-			{ if $follow; then tail -f ${num:+-n "$num"} "$log_file"
-			  else { cat "$log_file"; } | { [ -n "$num" ] && tail -n "$num" || cat; }
-			  fi } | pager "$follow" "$no_pager"
-			;;
-		# --- Access logs: Caddy JSON logs, parsed into human-readable format ---
-		access)
-			local log_file="$DEPLOY_ROOT/$app_name/access.log"
-			if [ ! -f "$log_file" ]; then die "No access log found for $app_name"; fi
-			local since_ts="" before_ts=""
-			[ -n "$since" ]  && { since_ts=$(date -d "$since" +%s 2>/dev/null)  || die "Invalid --since date: $since"; }
-			[ -n "$before" ] && { before_ts=$(date -d "$before" +%s 2>/dev/null) || die "Invalid --before date: $before"; }
-			# Parse Caddy JSON log lines into human-readable format
-			local jq_filter='select(
-				(if $since  != "" then .ts >= ($since  | tonumber) else true end) and
-				(if $before != "" then .ts <= ($before | tonumber) else true end)
-			) | [(.ts | strftime("%Y/%m/%d %H:%M:%S")), .request.method, .request.uri,
-			      (.status | tostring), (.size | tostring), "-", (((.duration * 1000) | floor | tostring) + " ms")] | join(" ")'
-			{
-				if $follow; then tail -f ${num:+-n "$num"} "$log_file"
-				else cat "$log_file"
-				fi \
-				| jq -r --arg since "$since_ts" --arg before "$before_ts" "$jq_filter" \
-				| { [ -n "$num" ] && ! $follow && tail -n "$num" || cat; }
-			} | pager "$follow" "$no_pager"
-			;;
-	esac
 }
 
 # internal: deploy an app (called by git post-receive hook)
@@ -720,11 +609,6 @@ configure() {
 			env_lines+="Environment=${env_var}"$'\n'
 		done < <(cat "$app_dir/env" 2>/dev/null || true)
 
-		local mount_lines=""
-		while IFS= read -r mount; do
-			mount_lines+="Bind=${mount}"$'\n'
-		done < <(cat "$app_dir/mounts" 2>/dev/null || true)
-
 		cat > "$release_dir/machine.nspawn" <<-NSPAWN
 		[Exec]
 		WorkingDirectory=/app
@@ -735,7 +619,6 @@ configure() {
 		Bind=$release_dir:/app
 		Bind=$app_dir/data:/data
 		BindReadOnly=/etc/resolv.conf
-		${mount_lines}
 		NSPAWN
 	fi
 
@@ -744,45 +627,28 @@ configure() {
 
 cmd_help() {
 	cat <<-HELP
-	📦 deploy.sh — minimal VPS deployment system
+	deploy.sh — minimal VPS deployment system
 
 	Usage: deploy <command> [args...]
 
-	Commands:
-	HELP
+	Apps:
+	  create <app>                    Create a new app
+	  list                            List all apps
+	  info <app>                      Show app status and configuration
+	  restart <app>                   Restart an app's container
+	  rollback <app>                  Roll back to a previous release
+	  remove <app> [-f]              Remove an app and all its files
 
-	# inline plugins
-	local fn
-	for fn in $(declare -F | awk '/^plugin:/{print $3}' | sort); do
-		local name="${fn#plugin:}"
-		local summary_var="PLUGIN_SUMMARY_${name}"
-		printf "  %-20s %s\n" "$name" "${!summary_var:-}"
-	done
+	Config:
+	  domains [list|add|remove] <app> [domain]    Manage domains
+	  env [list|set|remove] <app> [KEY=value]     Manage environment variables
+	  apply <app>                                 Apply config changes
 
-	# External plugins
-	if [ -d "$PLUGIN_DIR" ]; then
-		local plugin_file
-		for plugin_file in "$PLUGIN_DIR"/*; do
-			[ -f "$plugin_file" ] || continue
-			local name; name=$(basename "$plugin_file")
-			# skip if inline version exists
-			declare -f "plugin:${name}" > /dev/null 2>&1 && continue
-			local PLUGIN_SUMMARY=""
-			source "$plugin_file"
-			printf "  %-20s %s\n" "$name" "$PLUGIN_SUMMARY"
-		done
-	fi
-
-	cat <<-HELP
-
-	Shortcuts:
-	  create, list, info, restart, rollback, remove → deploy apps <cmd>
+	Logs:
+	  logs <app> [-f] [-n N]
 
 	System:
-	  init                Initialize the deployment system
-	  apply <app>         Apply config changes (domains, env, mounts)
-
-	Run "deploy <command> --help" for details on any command.
+	  init                            Initialize the deployment system
 
 	deploy.conf (in repo root):
 	  start=<cmd>                     Start command (receives \$PORT; omit for static sites)
@@ -793,33 +659,19 @@ cmd_help() {
 	HELP
 }
 
-plugin_help_logs() {
-	cat <<-HELP
-	Usage: deploy logs <app> [app|build|access] [options...]
-
-	Streams:
-	  app (default)       Container stdout/stderr (journald)
-	  build               Build step output
-	  access              HTTP access logs (Caddy)
-
-	Options:
-	  -f, --follow        Follow log output
-	  -n N                Show last N lines
-	  --since DATE        Show logs since date (app/access only)
-	  --before DATE       Show logs before date (app/access only)
-	  --no-pager          Disable pager
-	HELP
-}
-
 case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
 	init)           cmd_init ;;
 	apply)          shift; cmd_apply "$@" ;;
-	deploy)         shift; cmd_deploy_app "$@" ;;
-
-	# shortcuts → delegate to apps plugin
-	create|list|info|restart|rollback|remove) load_plugin apps "$@" ;;
-
-	# load plugins
-	*) load_plugin "$@" ;;
+	_deploy-app)    shift; cmd_deploy_app "$@" ;;
+	create)         shift; cmd_create "$@" ;;
+	list)           cmd_list ;;
+	info)           shift; cmd_info "$@" ;;
+	restart)        shift; cmd_restart "$@" ;;
+	rollback)       shift; cmd_rollback "$@" ;;
+	remove)         shift; cmd_remove "$@" ;;
+	domains)        shift; cmd_domains "$@" ;;
+	env)            shift; cmd_env "$@" ;;
+	logs)           shift; cmd_logs "$@" ;;
+	*)              die "Unknown command: $1. Run \"deploy help\" for usage" ;;
 esac

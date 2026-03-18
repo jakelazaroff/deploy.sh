@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# External plugin: keys — Manage SSH deploy keys for an app
+# Example: keys — Manage SSH deploy keys for an app
+#
+# To add this command to deploy.sh, paste everything below into deploy.sh
+# and add a case entry:  keys) shift; cmd_keys "$@" ;;
 
-PLUGIN_SUMMARY="Manage SSH deploy keys for an app"
-
-subcmd list     "<app-name>"                "List deploy keys for an app"
-subcmd add      "<app-name> <key> [pubkey]" "Add a restricted deploy key"
-subcmd remove   "<app-name> <key>"          "Remove a deploy key by name"
-subcmd generate "<app-name> <key>"          "Generate a new key pair"
+cmd_keys() {
+	escalate keys "$@"
+	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	case "$subcmd" in
+		list)     keys_list "$@" ;;
+		add)      keys_add "$@" ;;
+		remove)   keys_remove "$@" ;;
+		generate) keys_generate "$@" ;;
+		*)        die "Usage: deploy keys [list|add|remove|generate] <app> [key-name]" ;;
+	esac
+}
 
 _key_fingerprint() {
 	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
 }
 
-keys:list() {
-	require_app "${2:-}"
+keys_list() {
+	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 	local found=false
 	while IFS= read -r line; do
@@ -26,28 +34,26 @@ keys:list() {
 	$found || log "(no deploy keys for $app_name)"
 }
 
-keys:add() {
-	require_app "${2:-}"
+keys_add() {
+	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
-	require_arg "${3:-}" "Usage: deploy keys add <app-name> <key-name> [public-key]"
-	local key_name=$3 pubkey="${4:-}"
+	require_arg "${2:-}" "Usage: deploy keys add <app> <key-name> [public-key]"
+	local key_name=$2 pubkey="${3:-}"
 	[ -z "$pubkey" ] && read -r pubkey
 	[ -z "$pubkey" ] && die "No public key provided"
-	# Normalize: replace the original comment with "deploy:<app>:<key-name>"
-	# so entries can be listed and removed by name.
 	local keytype keydata _rest
 	read -r keytype keydata _rest <<< "$pubkey"
 	local normalized="$keytype $keydata deploy:$app_name:$key_name"
 	local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
 	echo "$entry" >> "$auth_keys"
-	log "✅ Added deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")"
+	success "Added deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")"
 }
 
-keys:remove() {
-	require_app "${2:-}"
+keys_remove() {
+	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
-	require_arg "${3:-}" "Usage: deploy keys remove <app-name> <key-name>"
-	local key_name=$3
+	require_arg "${2:-}" "Usage: deploy keys remove <app> <key-name>"
+	local key_name=$2
 	local tmpfile; tmpfile=$(mktemp)
 	local found=false
 	while IFS= read -r line; do
@@ -58,29 +64,28 @@ keys:remove() {
 	done < "$auth_keys"
 	if $found; then
 		mv "$tmpfile" "$auth_keys"
-		log "✅ Removed deploy key '$key_name' from $app_name"
+		success "Removed deploy key '$key_name' from $app_name"
 	else
 		rm -f "$tmpfile"
 		die "Key '$key_name' not found for $app_name"
 	fi
 }
 
-keys:generate() {
-	require_app "${2:-}"
+keys_generate() {
+	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
-	require_arg "${3:-}" "Usage: deploy keys generate <app-name> <key-name>"
-	local key_name=$3
+	require_arg "${2:-}" "Usage: deploy keys generate <app> <key-name>"
+	local key_name=$2
 	local tmpdir; tmpdir=$(mktemp -d)
 	local keyfile="$tmpdir/key"
 	ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "deploy:$app_name:$key_name" >/dev/null 2>&1
 	local pubkey; pubkey=$(cat "$keyfile.pub")
-	# Add the public key using the same logic as "add"
 	local keytype keydata _rest
 	read -r keytype keydata _rest <<< "$pubkey"
 	local normalized="$keytype $keydata deploy:$app_name:$key_name"
 	local entry="command=\"git-receive-pack '$app_dir/repo.git'\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $normalized"
 	echo "$entry" >> "$auth_keys"
-	log "✅ Generated deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")" >&2
+	success "Generated deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")" >&2
 	log "" >&2
 	cat "$keyfile"
 	rm -rf "$tmpdir"
