@@ -130,14 +130,14 @@ cmd_reconcile() {
 	cmd_configure "$app_name" "$slot"
 	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$slot/deploy.conf" "start")
 	if [ -n "$start_cmd" ]; then
-		systemctl restart "deploy@deploy-${app_name}--${slot}" || true
+		systemctl restart "$(app_unit "$app_name" "$slot")" || true
 	fi
 	reload_caddy
 }
 
 teardown_slot() {
 	local app_name=$1 slot=$2
-	systemctl stop "deploy@deploy-${app_name}--${slot}" 2>/dev/null || true
+	systemctl stop "$(app_unit "$app_name" "$slot")" 2>/dev/null || true
 	sed -i "/^${app_name}--${slot}=/d" "$DEPLOY_ROOT/.internal/ports"
 }
 
@@ -149,6 +149,7 @@ wait_for_port() {
 }
 
 other_slot() { [ "$1" = "blue" ] && echo "green" || echo "blue"; }
+app_unit()   { echo "deploy@$(systemd-escape -p "/${1}/${2}")"; } # systemd unit for an app slot
 
 reload_caddy() { systemctl reload caddy 2>/dev/null || true; }
 
@@ -158,7 +159,7 @@ activate_slot() {
 	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$new_slot/deploy.conf" "start")
 	if [ -n "$start_cmd" ]; then
 		local port; port=$(assign_port "$app_name" "$new_slot")
-		systemctl start "deploy@deploy-${app_name}--${new_slot}"
+		systemctl start "$(app_unit "$app_name" "$new_slot")"
 		if ! wait_for_port "$port"; then
 			teardown_slot "$app_name" "$new_slot"
 			die "Instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
@@ -333,7 +334,7 @@ cmd_init() {
 
 	[Service]
 	Type=simple
-	ExecStart=/usr/local/bin/deploy _start %i
+	ExecStart=/usr/bin/systemd-nspawn --quiet --machine=%i -D $DEPLOY_ROOT%f/machine
 	Restart=on-failure
 	KillMode=mixed
 	SERVICE
@@ -443,7 +444,7 @@ apps:info() {
 	if [ -f "$deploy_conf" ]; then
 		start_cmd=$(get_conf "$deploy_conf" "start")
 		if [ -n "$start_cmd" ] && [ -n "$active_slot" ]; then
-			status=$(systemctl is-active "deploy-${app_name}--${active_slot}" 2>/dev/null || true)
+			status=$(systemctl is-active "$(app_unit "$app_name" "$active_slot")" 2>/dev/null || true)
 		fi
 		assets=$(get_conf "$deploy_conf" "assets")
 		spa=$(get_conf "$deploy_conf" "spa")
@@ -489,7 +490,7 @@ apps:restart() {
 	require_app "${2:-}"; local app_name=$2
 	local slot; slot=$(cat "$app_dir/active" 2>/dev/null) || die "No active slot"
 	step "Restarting $app_name..."
-	systemctl restart "deploy@deploy-${app_name}--${slot}" || die "Failed to restart $app_name"
+	systemctl restart "$(app_unit "$app_name" "$slot")" || die "Failed to restart $app_name"
 	success "Restarted"
 }
 
@@ -626,7 +627,7 @@ plugin:logs() {
 	case "$stream" in
 		# --- App logs: container stdout/stderr via journald ---
 		app)
-			local args=(--no-pager -u "deploy-${app_name}--*")
+			local args=(--no-pager -u "deploy@$(systemd-escape -p "/${app_name}")-*")
 			$follow          && args+=(-f)
 			[ -n "$num" ]    && args+=(-n "$num")
 			[ -n "$since" ]  && args+=(--since "$since")
@@ -789,7 +790,6 @@ cmd_configure() {
 
 		# build up the Environment= lines from the env file
 		local env_lines=""
-		local env_lines=""
 		while IFS= read -r env_var; do
 			env_lines+="Environment=${env_var}"$'\n'
 		done < <(cat "$app_dir/env" 2>/dev/null || true)
@@ -859,11 +859,11 @@ cmd_help() {
 	Run "deploy <command> --help" for details on any command.
 
 	deploy.conf (in repo root):
-	  start=<cmd>         Start command (receives \$PORT; omit for static sites)
-	  build=<cmd>         Build command (runs in ephemeral container)
-	  assets=<dir>        Static assets directory (default: repo root)
-	  spa=true            Single-page app mode
-	  header=<path> <Name>: <value>   Response header (repeatable)
+	  start=<cmd>                     Start command (receives \$PORT; omit for static sites)
+	  build=<cmd>                     Build command
+	  assets=<dir>                    Static assets directory (default: repo root)
+	  spa=true                        Single-page app mode
+	  header=<path> <name>: <value>   Response header (repeatable)
 	HELP
 }
 
@@ -885,13 +885,6 @@ plugin_help_logs() {
 	HELP
 }
 
-cmd_start() {
-	# called by deploy@.service template: parse "deploy-<app>--<slot>" → machine dir
-	local machine=$1
-	local rest="${machine#deploy-}" app="${rest%--*}" slot="${rest##*--}"
-	exec systemd-nspawn --quiet --machine="$machine" -D "$DEPLOY_ROOT/$app/$slot/machine"
-}
-
 case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
 	init)           cmd_init ;;
@@ -901,7 +894,6 @@ case "${1:-help}" in
 	# internal (git hooks, systemd units, other commands)
 	_deploy-app)    shift; cmd_deploy_app "$@" ;;
 	reconcile)      shift; escalate reconcile "$@"; cmd_reconcile "$@" ;;
-	_start)         shift; cmd_start "$@" ;;
 
 	# try as plugin
 	*)              load_plugin "$@" ;;
