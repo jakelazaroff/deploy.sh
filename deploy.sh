@@ -156,7 +156,7 @@ cmd_create() {
 
 	cat > "$app_dir/repo.git/hooks/post-receive" <<-HOOK
 	#!/bin/bash
-	sudo /usr/local/bin/deploy _deploy-app $app_name
+	sudo /usr/local/bin/deploy deploy $app_name
 	HOOK
 	chmod +x "$app_dir/repo.git/hooks/post-receive"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
@@ -486,8 +486,8 @@ cmd_init() {
 	success "deploy.sh initialized"
 }
 
-# internal: deploy an app (called by git post-receive hook)
-cmd_deploy_app() {
+# deploy an app (called by git post-receive hook)
+cmd_deploy() {
 	require_arg "${1:-}" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 
@@ -663,7 +663,7 @@ case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
 	init)           cmd_init ;;
 	apply)          shift; cmd_apply "$@" ;;
-	_deploy-app)    shift; cmd_deploy_app "$@" ;;
+	deploy)         shift; cmd_deploy "$@" ;;
 	create)         shift; cmd_create "$@" ;;
 	list)           cmd_list ;;
 	info)           shift; cmd_info "$@" ;;
