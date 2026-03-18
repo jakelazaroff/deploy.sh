@@ -18,7 +18,7 @@ PLUGIN_DIR="$DEPLOY_ROOT/.plugins"
 PORT_RANGE_START=49152   # first ephemeral port
 PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
 
-# UTILITIES
+# --- utilities ---
 
 red() { printf "\033[31m$1\033[0m"; }
 green() { printf "\033[32m$1\033[0m"; }
@@ -33,15 +33,15 @@ die() { error "$1"; exit 1; }        # print an error and exit
 require_arg() { [ -n "${1:-}" ] || die "$2"; }
 
 require_app() {
-	require_arg "${1:-}" "Usage: deploy $PLUGIN_NAME <subcmd> <app-name>"
+	require_arg "${1:-}" "Usage: deploy $PLUGIN_NAME <subcmd> <app>"
 	[ -d "$DEPLOY_ROOT/$1" ] || die "App $1 does not exist"
 	app_dir="$DEPLOY_ROOT/$1"
 }
 
-# Register a subcommand: name | usage | description
+# register a subcommand: name | usage | description
 subcmd() { SUBCMDS_DATA="${SUBCMDS_DATA}${1}|${2}|${3}"$'\n'; }
 
-# Validate subcmd, escalate, then call <plugin>:<subcmd> "$@"
+# validate subcmd, escalate, then call <plugin>:<subcmd> "$@"
 dispatch() {
 	local subcmd="${1:-}"
 	if [[ "$subcmd" == --help || "$subcmd" == -h || "$subcmd" == help || -z "$subcmd" ]]; then
@@ -122,16 +122,17 @@ assign_port() {
 }
 
 # Re-configure and restart the active slot.
-# Used by domains/env/mounts add/remove to apply config changes.
-reconfigure() {
+# Called by deploy-watch@.service when domains or env files change.
+# Returns 0 (no-op) if app hasn't been deployed yet.
+cmd_reconcile() {
 	local app_name=$1
-	local slot; slot=$(cat "$DEPLOY_ROOT/$app_name/active" 2>/dev/null) || die "Not yet deployed"
+	local slot; slot=$(cat "$DEPLOY_ROOT/$app_name/active" 2>/dev/null) || return 0
 	cmd_configure "$app_name" "$slot"
 	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$slot/deploy.conf" "start")
 	if [ -n "$start_cmd" ]; then
 		systemctl restart "deploy@deploy-${app_name}--${slot}" || true
 	fi
-	systemctl reload caddy 2>/dev/null || true
+	reload_caddy
 }
 
 teardown_slot() {
@@ -147,6 +148,27 @@ wait_for_port() {
 	done
 }
 
+other_slot() { [ "$1" = "blue" ] && echo "green" || echo "blue"; }
+
+reload_caddy() { systemctl reload caddy 2>/dev/null || true; }
+
+# Zero-downtime slot swap: start new container, wait for it, teardown old, update active pointer.
+activate_slot() {
+	local app_name=$1 new_slot=$2 old_slot=${3:-}
+	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$new_slot/deploy.conf" "start")
+	if [ -n "$start_cmd" ]; then
+		local port; port=$(assign_port "$app_name" "$new_slot")
+		systemctl start "deploy@deploy-${app_name}--${new_slot}"
+		if ! wait_for_port "$port"; then
+			teardown_slot "$app_name" "$new_slot"
+			die "Instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
+		fi
+		[ -n "$old_slot" ] && teardown_slot "$app_name" "$old_slot"
+	fi
+	echo "$new_slot" > "$DEPLOY_ROOT/$app_name/active"
+	reload_caddy
+}
+
 load_plugin() {
 	local cmd="$1"; shift
 	PLUGIN_NAME="$cmd"
@@ -155,8 +177,8 @@ load_plugin() {
 	local plugin_file="$PLUGIN_DIR/$cmd"
 	[ -f "$plugin_file" ] && source "$plugin_file"
 
-	if declare -f "plugin_run_${cmd}" > /dev/null 2>&1; then
-		"plugin_run_${cmd}" "$@"
+	if declare -f "plugin:${cmd}" > /dev/null 2>&1; then
+		"plugin:${cmd}" "$@"
 	else
 		die "Unknown command: $cmd. Run \"deploy help\" for usage"
 	fi
@@ -266,9 +288,10 @@ cmd_init() {
 		success "Copied SSH authorized_keys from $src_keys"
 	fi
 
-	# create deploy directory
+	# create deploy directory — group-writable so deploy group members can script against files directly
 	mkdir -p "$DEPLOY_ROOT/.internal" "$PLUGIN_DIR"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
+	chmod 2775 "$DEPLOY_ROOT"
 
 	# pull Alpine base image
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
@@ -290,7 +313,6 @@ cmd_init() {
 		success "Created Caddyfile"
 	fi
 
-	# --- create Caddy systemd service ---
 	# override caddy's service to use our Caddyfile
 	mkdir -p /etc/systemd/system/caddy.service.d
 	cat > /etc/systemd/system/caddy.service.d/deploy.conf <<-OVERRIDE
@@ -303,7 +325,7 @@ cmd_init() {
 	systemctl daemon-reload
 	systemctl enable --now caddy
 
-	# --- Create deploy@ template service ---
+	# create deploy@ template service
 	cat > "$DEPLOY_ROOT/.internal/deploy@.service" <<-SERVICE
 	[Unit]
 	Description=deploy.sh container %i
@@ -316,9 +338,35 @@ cmd_init() {
 	KillMode=mixed
 	SERVICE
 	ln -sf "$DEPLOY_ROOT/.internal/deploy@.service" /etc/systemd/system/deploy@.service
+
+	# create deploy-watch@ template units
+	cat > "$DEPLOY_ROOT/.internal/deploy-watch@.path" <<-PATH
+	[Unit]
+	Description=Watch deploy.sh config for %i
+
+	[Path]
+	PathChanged=$DEPLOY_ROOT/%i/domains
+	PathChanged=$DEPLOY_ROOT/%i/env
+	PathChanged=$DEPLOY_ROOT/%i/mounts
+
+	[Install]
+	WantedBy=multi-user.target
+	PATH
+	ln -sf "$DEPLOY_ROOT/.internal/deploy-watch@.path" /etc/systemd/system/deploy-watch@.path
+
+	cat > "$DEPLOY_ROOT/.internal/deploy-watch@.service" <<-SERVICE
+	[Unit]
+	Description=Reconcile deploy.sh config for %i
+
+	[Service]
+	Type=oneshot
+	ExecStart=/usr/local/bin/deploy reconcile %i
+	SERVICE
+	ln -sf "$DEPLOY_ROOT/.internal/deploy-watch@.service" /etc/systemd/system/deploy-watch@.service
+
 	systemctl daemon-reload
 
-	# --- Set up sudoers ---
+	# set up sudoers
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	Defaults env_keep += "SSH_AUTH_SOCK"
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
@@ -327,16 +375,30 @@ cmd_init() {
 	chmod 0440 /etc/sudoers.d/deploy
 	success "Created /etc/sudoers.d/deploy"
 
-	log ""
-	success "System initialized!"
-	log "   Location: $DEPLOY_ROOT"
-	log ""
-	log "Next: deploy create <app-name>"
+	success "deploy.sh initialized"
 }
 
-# Create a new app and its bare git repo
+# Pipe to pager unless following output (-f) or user passed --no-pager
+pager() {
+	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
+}
+
+# --- apps plugin ---
+
+PLUGIN_SUMMARY_apps="Manage apps"
+
+plugin:apps() {
+	subcmd create   "<name>"       "Create a new app"
+	subcmd list     ""             "List all apps"
+	subcmd info     "<name>"       "Show app status and configuration"
+	subcmd restart  "<name>"       "Restart an app's container"
+	subcmd rollback "<name>"       "Roll back to a previous release"
+	subcmd remove   "<name> [-f]"  "Remove an app and all its files"
+	dispatch "$@"
+}
+
 apps:create() {
-	require_arg "${2:-}" "Usage: deploy create <app-name>"
+	require_arg "${2:-}" "Usage: deploy create <app>"
 	local app_name=$2; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
 	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
@@ -351,6 +413,10 @@ apps:create() {
 	HOOK
 	chmod +x "$app_dir/repo.git/hooks/post-receive"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
+	chmod 2775 "$app_dir"
+	touch "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
+	chmod 664 "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
+	systemctl enable --now "deploy-watch@${app_name}.path"
 
 	success "Created app: $app_name"
 	log ""
@@ -358,7 +424,6 @@ apps:create() {
 	log "  git remote add deploy $DEPLOY_USER@$(hostname):$app_dir/repo.git"
 	log "  git push deploy main"
 	log ""
-	log "See 'deploy help' for deploy.conf format."
 }
 
 apps:list() {
@@ -420,16 +485,122 @@ apps:info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
-# Pipe to pager unless following output (-f) or user passed --no-pager
-pager() {
-	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
+apps:restart() {
+	require_app "${2:-}"; local app_name=$2
+	local slot; slot=$(cat "$app_dir/active" 2>/dev/null) || die "No active slot"
+	step "Restarting $app_name..."
+	systemctl restart "deploy@deploy-${app_name}--${slot}" || die "Failed to restart $app_name"
+	success "Restarted"
 }
 
+apps:rollback() {
+	require_app "${2:-}"; local app_name=$2
+	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null) || die "Nothing deployed"
+	local prev_slot; prev_slot=$(other_slot "$active_slot")
+	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
+
+	activate_slot "$app_name" "$prev_slot" "$active_slot"
+	success "Rolled back $app_name"
+}
+
+apps:remove() {
+	require_app "${2:-}"; local app_name=$2
+	local force=false; [[ "${3:-}" == "-f" || "${3:-}" == "--force" ]] && force=true
+	if ! $force; then
+		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
+		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
+	fi
+	step "Removing $app_name..."
+	systemctl disable --now "deploy-watch@${app_name}.path" 2>/dev/null || true
+	teardown_slot "$app_name" "blue"
+	teardown_slot "$app_name" "green"
+	systemctl daemon-reload
+	local ports_file="$DEPLOY_ROOT/.internal/ports"
+	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
+	step "Removing app files..."
+	rm -rf "$app_dir"
+	reload_caddy
+	success "Removed $app_name"
+}
+
+# --- domains plugin ---
+
+PLUGIN_SUMMARY_domains="Manage domains for an app"
+
+plugin:domains() {
+	subcmd list   "<app>"          "List domains for an app"
+	subcmd add    "<app> <domain>" "Add a domain"
+	subcmd remove "<app> <domain>" "Remove a domain"
+	dispatch "$@"
+}
+
+domains:list() {
+	require_app "${2:-}"
+	cat "$app_dir/domains" 2>/dev/null || true
+}
+
+domains:add() {
+	require_app "${2:-}"
+	local domain=${3:-}
+	require_arg "$domain" "Usage: deploy domains add <app> <domain>"
+	check_domain_collision "$domain" "$app_name"
+	echo "$domain" >> "$app_dir/domains"
+	success "Added domain $domain to $app_name"
+	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+}
+
+domains:remove() {
+	require_app "${2:-}"
+	local domain=${3:-}
+	require_arg "$domain" "Usage: deploy domains remove <app> <domain>"
+	sed -i "/^${domain}$/d" "$app_dir/domains"
+	success "Removed domain $domain from $app_name"
+	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+}
+
+# --- env plugin ---
+
+PLUGIN_SUMMARY_env="Manage environment variables for an app"
+
+plugin:env() {
+	subcmd list   "<app>"           "List environment variables"
+	subcmd set    "<app> KEY=value" "Set an environment variable"
+	subcmd remove "<app> KEY"       "Remove an environment variable"
+	dispatch "$@"
+}
+
+env:list() {
+	require_app "${2:-}"
+	cat "$app_dir/env" 2>/dev/null || true
+}
+
+env:set() {
+	require_app "${2:-}"
+	local kv=${3:-}
+	require_arg "$kv" "Usage: deploy env set <app> KEY=value"
+	[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
+	local key="${kv%%=*}"
+	# replace semantics: remove existing key then append
+	sed -i "/^${key}=/d" "$app_dir/env"
+	echo "$kv" >> "$app_dir/env"
+	success "Set $key for $app_name"
+	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+}
+
+env:remove() {
+	require_app "${2:-}"
+	local key=${3:-}
+	require_arg "$key" "Usage: deploy env remove <app> KEY"
+	sed -i "/^${key}=/d" "$app_dir/env"
+	success "Removed $key from $app_name"
+	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+}
+
+# --- logs plugin ---
 
 PLUGIN_SUMMARY_logs="View app, build, or access logs"
 
-# View app logs (journald), build output, or HTTP access logs
-plugin_run_logs() {
+plugin:logs() {
 	if [ -z "${1:-}" ] || [[ "${1:-}" == --help ]] || [[ "${1:-}" == -h ]]; then plugin_help_logs; return; fi
 	escalate logs "$@"
 	local app_name=$1; shift
@@ -495,139 +666,6 @@ plugin_run_logs() {
 	esac
 }
 
-PLUGIN_SUMMARY_domains="Manage domains for an app"
-
-# Manage domains for an app
-plugin_run_domains() {
-	subcmd list   "<app-name>"          "List domains for an app"
-	subcmd add    "<app-name> <domain>" "Add a domain"
-	subcmd remove "<app-name> <domain>" "Remove a domain"
-	dispatch "$@"
-}
-
-domains:list() {
-	require_app "${2:-}"
-	cat "$app_dir/domains" 2>/dev/null || true
-}
-
-domains:add() {
-	require_app "${2:-}"
-	local domain=${3:-}
-	require_arg "$domain" "Usage: deploy domains add <app-name> <domain>"
-	check_domain_collision "$domain" "$app_name"
-	echo "$domain" >> "$app_dir/domains"
-	success "Added domain $domain to $app_name"
-	reconfigure "$app_name"
-}
-
-domains:remove() {
-	require_app "${2:-}"
-	local domain=${3:-}
-	require_arg "$domain" "Usage: deploy domains remove <app-name> <domain>"
-	grep -qx "$domain" "$app_dir/domains" 2>/dev/null || die "Domain $domain not found for $app_name"
-	grep -vx "$domain" "$app_dir/domains" > "$app_dir/domains.tmp" && mv "$app_dir/domains.tmp" "$app_dir/domains"
-	success "Removed domain $domain from $app_name"
-	reconfigure "$app_name"
-}
-
-PLUGIN_SUMMARY_env="Manage environment variables for an app"
-
-# Manage environment variables for an app
-plugin_run_env() {
-	subcmd list   "<app-name>"           "List environment variables"
-	subcmd set    "<app-name> KEY=value" "Set an environment variable"
-	subcmd remove "<app-name> KEY"       "Remove an environment variable"
-	dispatch "$@"
-}
-
-env:list() {
-	require_app "${2:-}"
-	cat "$app_dir/env" 2>/dev/null || true
-}
-
-env:set() {
-	require_app "${2:-}"
-	local kv=${3:-}
-	require_arg "$kv" "Usage: deploy env set <app-name> KEY=value"
-	[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
-	local key="${kv%%=*}"
-	# replace semantics: remove existing key then append
-	grep -v "^${key}=" "$app_dir/env" > "$app_dir/env.tmp" 2>/dev/null || true
-	echo "$kv" >> "$app_dir/env.tmp" && mv "$app_dir/env.tmp" "$app_dir/env"
-	success "Set $key for $app_name"
-	reconfigure "$app_name"
-}
-
-env:remove() {
-	require_app "${2:-}"
-	local key=${3:-}
-	require_arg "$key" "Usage: deploy env remove <app-name> KEY"
-	grep -q "^${key}=" "$app_dir/env" 2>/dev/null || die "Environment variable $key not found for $app_name"
-	grep -v "^${key}=" "$app_dir/env" > "$app_dir/env.tmp" && mv "$app_dir/env.tmp" "$app_dir/env"
-	success "Removed $key from $app_name"
-	reconfigure "$app_name"
-}
-
-PLUGIN_SUMMARY_apps="Manage apps"
-
-# App management namespace
-plugin_run_apps() {
-	subcmd list     ""             "List all apps"
-	subcmd create   "<name>"       "Create a new app"
-	subcmd info     "<name>"       "Show app status and configuration"
-	subcmd restart  "<name>"       "Restart an app's container"
-	subcmd rollback "<name>"       "Roll back to a previous release"
-	subcmd remove   "<name> [-f]"  "Remove an app and all its files"
-	dispatch "$@"
-}
-
-apps:restart() {
-	require_app "${2:-}"; local app_name=$2
-	local slot; slot=$(cat "$app_dir/active" 2>/dev/null) || die "No active slot"
-	step "Restarting $app_name..."
-	systemctl restart "deploy@deploy-${app_name}--${slot}" || die "Failed to restart $app_name"
-	success "Restarted"
-}
-
-apps:rollback() {
-	require_app "${2:-}"; local app_name=$2
-	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null) || die "Nothing deployed"
-	local prev_slot; prev_slot=$( [ "$active_slot" = "blue" ] && echo "green" || echo "blue" )
-	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
-
-	local start_cmd; start_cmd=$(get_conf "$app_dir/$prev_slot/deploy.conf" "start")
-	if [ -n "$start_cmd" ]; then
-		local port; port=$(assign_port "$app_name" "$prev_slot")
-		systemctl start "deploy@deploy-${app_name}--${prev_slot}"
-		wait_for_port "$port" || die "Previous instance failed to start on port $port"
-		teardown_slot "$app_name" "$active_slot"
-	fi
-
-	echo "$prev_slot" > "$app_dir/active"
-	systemctl reload caddy 2>/dev/null || true
-	success "Rolled back $app_name"
-}
-
-apps:remove() {
-	require_app "${2:-}"; local app_name=$2
-	local force=false; [[ "${3:-}" == "-f" || "${3:-}" == "--force" ]] && force=true
-	if ! $force; then
-		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
-		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
-	fi
-	step "Removing $app_name..."
-	teardown_slot "$app_name" "blue"
-	teardown_slot "$app_name" "green"
-	systemctl daemon-reload
-	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
-	step "Removing app files..."
-	rm -rf "$app_dir"
-	step "Reloading Caddy..."
-	systemctl reload caddy 2>/dev/null || true
-	success "Removed $app_name"
-}
-
 # Internal: deploy an app (called by git post-receive hook)
 cmd_deploy_app() {
 	require_arg "${1:-}" "Internal error: app name required"
@@ -635,9 +673,8 @@ cmd_deploy_app() {
 
 	# build into whichever slot isn't currently active
 	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null || echo "")
-	local next_slot; next_slot=$( [ "$active_slot" = "blue" ] && echo "green" || echo "blue" )
+	local next_slot; next_slot=$(other_slot "$active_slot")
 	local release_dir="$app_dir/$next_slot"
-	local svc="deploy-${app_name}--${next_slot}"
 
 	local status_file="$app_dir/deploy.status"
 	local build_log="$release_dir/build.log"
@@ -692,19 +729,7 @@ cmd_deploy_app() {
 
 	cmd_configure "$app_name" "$next_slot"
 
-	if [ -n "$start_cmd" ]; then
-		# zero-downtime swap: start new, wait for it to be ready, then stop old
-		local port; port=$(assign_port "$app_name" "$next_slot")
-		systemctl start "deploy@${svc}"
-		if ! wait_for_port "$port"; then
-			teardown_slot "$app_name" "$next_slot"
-			die "New instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
-		fi
-		[ -n "$active_slot" ] && teardown_slot "$app_name" "$active_slot"
-	fi
-
-	echo "$next_slot" > "$app_dir/active"
-	systemctl reload caddy 2>/dev/null || true
+	activate_slot "$app_name" "$next_slot" "$active_slot"
 	success "Deployed $app_name"
 
 	trap - EXIT
@@ -764,9 +789,15 @@ cmd_configure() {
 
 		# build up the Environment= lines from the env file
 		local env_lines=""
+		local env_lines=""
 		while IFS= read -r env_var; do
 			env_lines+="Environment=${env_var}"$'\n'
 		done < <(cat "$app_dir/env" 2>/dev/null || true)
+
+		local mount_lines=""
+		while IFS= read -r mount; do
+			mount_lines+="Bind=${mount}"$'\n'
+		done < <(cat "$app_dir/mounts" 2>/dev/null || true)
 
 		cat > "$release_dir/machine.nspawn" <<-NSPAWN
 		[Exec]
@@ -778,6 +809,7 @@ cmd_configure() {
 		Bind=$release_dir:/app
 		Bind=$app_dir/data:/data
 		BindReadOnly=/etc/resolv.conf
+		${mount_lines}
 		NSPAWN
 	fi
 
@@ -795,8 +827,8 @@ cmd_help() {
 
 	# inline plugins
 	local fn
-	for fn in $(declare -F | awk '/plugin_run_/{print $3}' | sort); do
-		local name="${fn#plugin_run_}"
+	for fn in $(declare -F | awk '/^plugin:/{print $3}' | sort); do
+		local name="${fn#plugin:}"
 		local summary_var="PLUGIN_SUMMARY_${name}"
 		printf "  %-20s %s\n" "$name" "${!summary_var:-}"
 	done
@@ -808,7 +840,7 @@ cmd_help() {
 			[ -f "$plugin_file" ] || continue
 			local name; name=$(basename "$plugin_file")
 			# skip if inline version exists
-			declare -f "plugin_run_${name}" > /dev/null 2>&1 && continue
+			declare -f "plugin:${name}" > /dev/null 2>&1 && continue
 			local PLUGIN_SUMMARY=""
 			source "$plugin_file"
 			printf "  %-20s %s\n" "$name" "$PLUGIN_SUMMARY"
@@ -822,6 +854,7 @@ cmd_help() {
 
 	System:
 	  init                Initialize the deployment system
+	  reconcile <app>     Re-apply config from domains/env files
 
 	Run "deploy <command> --help" for details on any command.
 
@@ -836,7 +869,7 @@ cmd_help() {
 
 plugin_help_logs() {
 	cat <<-HELP
-	Usage: deploy logs <app-name> [app|build|access] [options...]
+	Usage: deploy logs <app> [app|build|access] [options...]
 
 	Streams:
 	  app (default)       Container stdout/stderr (journald)
@@ -865,9 +898,9 @@ case "${1:-help}" in
 # shortcuts → delegate to apps plugin
 	create|list|info|restart|rollback|remove) load_plugin apps "$@" ;;
 
-	# internal (git hooks, other commands)
+	# internal (git hooks, systemd units, other commands)
 	_deploy-app)    shift; cmd_deploy_app "$@" ;;
-	_configure)     shift; cmd_configure "$@" ;;
+	reconcile)      shift; escalate reconcile "$@"; cmd_reconcile "$@" ;;
 	_start)         shift; cmd_start "$@" ;;
 
 	# try as plugin
