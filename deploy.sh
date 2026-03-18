@@ -35,7 +35,7 @@ require_arg() { [ -n "${1:-}" ] || die "$2"; }
 require_app() {
 	require_arg "${1:-}" "Usage: deploy $PLUGIN_NAME <subcmd> <app>"
 	[ -d "$DEPLOY_ROOT/$1" ] || die "App $1 does not exist"
-	app_dir="$DEPLOY_ROOT/$1"
+	app_name="$1"; app_dir="$DEPLOY_ROOT/$1"
 }
 
 # register a subcommand: name | usage | description
@@ -71,27 +71,6 @@ escalate() {
 	exec sudo "$0" "$@"
 }
 
-# Deploy status tracking: cmd_deploy_app sets these globals so the EXIT trap
-# can write a "failed" status if the deploy exits early (e.g. build failure).
-_DEPLOY_STATUS_FILE=""
-_DEPLOY_START_TIME=""
-_deploy_exit_trap() {
-	[ -z "$_DEPLOY_STATUS_FILE" ] && return
-	local finish; finish=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-	printf 'status=failed\nstarted=%s\nfinished=%s\n' "$_DEPLOY_START_TIME" "$finish" > "$_DEPLOY_STATUS_FILE"
-}
-
-check_domain_collision() {
-	local domain=$1 exclude_app=${2:-}
-	local domains_file
-	for domains_file in "$DEPLOY_ROOT"/*/domains; do
-		[ -f "$domains_file" ] || continue
-		local app_name; app_name=$(basename "$(dirname "$domains_file")")
-		[ "$app_name" = "$exclude_app" ] && continue
-		grep -qx "$domain" "$domains_file" 2>/dev/null && die "Domain $domain already used by $app_name"
-	done
-}
-
 # get a value matching a given key from a config file, falling back to default
 get_conf() {
 	local file=$1 key=$2 default=${3:-}
@@ -105,6 +84,41 @@ get_conf_all() {
 	local file=$1 key=$2
 	if [ -f "$file" ]; then grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-; fi
 }
+
+check_domain_collision() {
+	local domain=$1 exclude_app=${2:-}
+	local domains_file
+	for domains_file in "$DEPLOY_ROOT"/*/domains; do
+		[ -f "$domains_file" ] || continue
+		local app_name; app_name=$(basename "$(dirname "$domains_file")")
+		[ "$app_name" = "$exclude_app" ] && continue
+		grep -qx "$domain" "$domains_file" 2>/dev/null && die "Domain $domain already used by $app_name"
+	done
+}
+
+wait_for_port() {
+	local port=$1 i=$((PORT_WAIT_SECONDS * 2))
+	while ! ss -tln "sport = :$port" | grep -q LISTEN; do
+		sleep 0.5; ((i--)) || return 1
+	done
+}
+
+other_slot()  { [ "$1" = "blue" ] && echo "green" || echo "blue"; }
+active_slot() { cat "$DEPLOY_ROOT/$1/active" 2>/dev/null || true; }
+
+# systemd unit for an app slot
+app_unit() { echo "deploy@$(systemd-escape -p "/${1}/${2}")"; }
+
+# pipe to pager unless following output (-f) or user passed --no-pager
+pager() {
+	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
+}
+
+# --- config files ---
+
+# --- lifecycle ---
+
+reload_caddy() { systemctl reload caddy 2>/dev/null || true; }
 
 assign_port() {
 	local app_name=$1 slot=$2
@@ -121,41 +135,9 @@ assign_port() {
 	) 9>>"$ports_file.lock"
 }
 
-# Re-configure and restart the active slot.
-# Called by deploy-watch@.service when domains or env files change.
-# Returns 0 (no-op) if app hasn't been deployed yet.
-cmd_reconcile() {
-	local app_name=$1
-	local slot; slot=$(cat "$DEPLOY_ROOT/$app_name/active" 2>/dev/null) || return 0
-	cmd_configure "$app_name" "$slot"
-	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$slot/deploy.conf" "start")
-	if [ -n "$start_cmd" ]; then
-		systemctl restart "$(app_unit "$app_name" "$slot")" || true
-	fi
-	reload_caddy
-}
-
-teardown_slot() {
-	local app_name=$1 slot=$2
-	systemctl stop "$(app_unit "$app_name" "$slot")" 2>/dev/null || true
-	sed -i "/^${app_name}--${slot}=/d" "$DEPLOY_ROOT/.internal/ports"
-}
-
-wait_for_port() {
-	local port=$1 i=$((PORT_WAIT_SECONDS * 2))
-	while ! ss -tln "sport = :$port" | grep -q LISTEN; do
-		sleep 0.5; ((i--)) || return 1
-	done
-}
-
-other_slot() { [ "$1" = "blue" ] && echo "green" || echo "blue"; }
-app_unit()   { echo "deploy@$(systemd-escape -p "/${1}/${2}")"; } # systemd unit for an app slot
-
-reload_caddy() { systemctl reload caddy 2>/dev/null || true; }
-
-# Zero-downtime slot swap: start new container, wait for it, teardown old, update active pointer.
+# zero-downtime slot swap: start new container, wait for it, teardown old, update active pointer.
 activate_slot() {
-	local app_name=$1 new_slot=$2 old_slot=${3:-}
+	local app_name=$1 new_slot=$2
 	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$new_slot/deploy.conf" "start")
 	if [ -n "$start_cmd" ]; then
 		local port; port=$(assign_port "$app_name" "$new_slot")
@@ -164,9 +146,32 @@ activate_slot() {
 			teardown_slot "$app_name" "$new_slot"
 			die "Instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
 		fi
-		[ -n "$old_slot" ] && teardown_slot "$app_name" "$old_slot"
+		teardown_slot "$app_name" "$(other_slot "$new_slot")"
 	fi
 	echo "$new_slot" > "$DEPLOY_ROOT/$app_name/active"
+	reload_caddy
+}
+
+teardown_slot() {
+	local app_name=$1 slot=$2
+	[ -n "$slot" ] || return 0
+	systemctl stop "$(app_unit "$app_name" "$slot")" 2>/dev/null || true
+	sed -i "/^${app_name}--${slot}=/d" "$DEPLOY_ROOT/.internal/ports"
+}
+
+# --- commands ---
+
+# Re-configure and restart the active slot.
+# No-op if app hasn't been deployed yet.
+cmd_apply() {
+	escalate apply "$@"
+	local app_name=$1
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || return 0
+	configure "$app_name" "$slot"
+	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$slot/deploy.conf" "start")
+	if [ -n "$start_cmd" ]; then
+		systemctl restart "$(app_unit "$app_name" "$slot")" || true
+	fi
 	reload_caddy
 }
 
@@ -185,69 +190,9 @@ load_plugin() {
 	fi
 }
 
-# SUBCOMMANDS
+# --- subcommands ---
 
-# CONFIG GENERATORS
-
-write_global_caddyfile() {
-	local dest=$1 acme_email=$2
-	cat > "$dest" <<-CADDY
-	{
-	    email $acme_email
-	}
-
-	(logging) {
-	    log {
-	        output file {args[0]}/access.log
-	        format json
-	    }
-	}
-
-	(static) {
-	    file_server
-	    encode gzip
-	}
-
-	(proxy) {
-	    reverse_proxy localhost:{args[0]} {
-	        header_up Host {http.request.host}
-	    }
-	}
-
-	(spa) {
-	    try_files {path} /index.html
-	    import static
-	}
-
-	(assets) {
-	    @static file
-	    handle @static {
-	        import static
-	    }
-	    handle {
-	        import proxy {args[0]}
-	    }
-	}
-
-	import $DEPLOY_ROOT/*/caddy.conf
-	CADDY
-}
-
-
-write_app_caddy_conf() {
-	local dest=$1 domains=$2 app_dir=$3 slot=$4 static_dir=$5 headers=$6 handler=$7
-	cat > "$dest" <<-CADDY
-	$domains {
-	    root * $app_dir/$slot${static_dir:+/$static_dir}
-	    $headers
-	    $handler
-	        import logging "$app_dir"
-	}
-	CADDY
-	caddy fmt "$dest" --overwrite
-}
-
-# Initialize the deployment system (must be run as root)
+# initialize the deployment system
 cmd_init() {
 	if [ "$(id -u)" -ne 0 ]; then die "deploy init must be run as root"; fi
 	step "Setting up deploy.sh at $DEPLOY_ROOT..."
@@ -306,11 +251,50 @@ cmd_init() {
 		success "Base image ready"
 	fi
 
-	# --- create Caddyfile ---
+	# create Caddyfile
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
-		write_global_caddyfile "$DEPLOY_ROOT/.internal/Caddyfile" "$acme_email"
+		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
+		{
+		    email $acme_email
+		}
+
+		(logging) {
+		    log {
+		        output file {args[0]}/access.log
+		        format json
+		    }
+		}
+
+		(static) {
+		    file_server
+		    encode gzip
+		}
+
+		(proxy) {
+		    reverse_proxy localhost:{args[0]} {
+		        header_up Host {http.request.host}
+		    }
+		}
+
+		(spa) {
+		    try_files {path} /index.html
+		    import static
+		}
+
+		(assets) {
+		    @static file
+		    handle @static {
+		        import static
+		    }
+		    handle {
+		        import proxy {args[0]}
+		    }
+		}
+
+		import $DEPLOY_ROOT/*/caddy.conf
+		CADDY
 		success "Created Caddyfile"
 	fi
 
@@ -340,31 +324,6 @@ cmd_init() {
 	SERVICE
 	ln -sf "$DEPLOY_ROOT/.internal/deploy@.service" /etc/systemd/system/deploy@.service
 
-	# create deploy-watch@ template units
-	cat > "$DEPLOY_ROOT/.internal/deploy-watch@.path" <<-PATH
-	[Unit]
-	Description=Watch deploy.sh config for %i
-
-	[Path]
-	PathChanged=$DEPLOY_ROOT/%i/domains
-	PathChanged=$DEPLOY_ROOT/%i/env
-	PathChanged=$DEPLOY_ROOT/%i/mounts
-
-	[Install]
-	WantedBy=multi-user.target
-	PATH
-	ln -sf "$DEPLOY_ROOT/.internal/deploy-watch@.path" /etc/systemd/system/deploy-watch@.path
-
-	cat > "$DEPLOY_ROOT/.internal/deploy-watch@.service" <<-SERVICE
-	[Unit]
-	Description=Reconcile deploy.sh config for %i
-
-	[Service]
-	Type=oneshot
-	ExecStart=/usr/local/bin/deploy reconcile %i
-	SERVICE
-	ln -sf "$DEPLOY_ROOT/.internal/deploy-watch@.service" /etc/systemd/system/deploy-watch@.service
-
 	systemctl daemon-reload
 
 	# set up sudoers
@@ -377,11 +336,6 @@ cmd_init() {
 	success "Created /etc/sudoers.d/deploy"
 
 	success "deploy.sh initialized"
-}
-
-# Pipe to pager unless following output (-f) or user passed --no-pager
-pager() {
-	if [ "${1:-}" != "true" ] && [ "${2:-}" != "true" ] && [ -t 1 ]; then less -FRX; else cat; fi
 }
 
 # --- apps plugin ---
@@ -417,7 +371,6 @@ apps:create() {
 	chmod 2775 "$app_dir"
 	touch "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
 	chmod 664 "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
-	systemctl enable --now "deploy-watch@${app_name}.path"
 
 	success "Created app: $app_name"
 	log ""
@@ -437,43 +390,21 @@ apps:list() {
 
 apps:info() {
 	require_app "${2:-}"; local app_name=$2
-	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null || echo "")
-	local deploy_conf="$app_dir/$active_slot/deploy.conf"
+	local slot; slot=$(active_slot "$app_name")
+	local deploy_conf="$app_dir/$slot/deploy.conf"
 
 	local start_cmd="" status="" assets="" spa=""
 	if [ -f "$deploy_conf" ]; then
 		start_cmd=$(get_conf "$deploy_conf" "start")
-		if [ -n "$start_cmd" ] && [ -n "$active_slot" ]; then
-			status=$(systemctl is-active "$(app_unit "$app_name" "$active_slot")" 2>/dev/null || true)
+		if [ -n "$start_cmd" ] && [ -n "$slot" ]; then
+			status=$(systemctl is-active "$(app_unit "$app_name" "$slot")" 2>/dev/null || true)
 		fi
 		assets=$(get_conf "$deploy_conf" "assets")
 		spa=$(get_conf "$deploy_conf" "spa")
 	fi
 	local domains_list; domains_list=$(cat "$app_dir/domains" 2>/dev/null || true)
 
-	local status_file="$app_dir/deploy.status"
-	local deploy_status="" deploy_started="" deploy_finished="" deploy_pid=""
-	if [ -f "$status_file" ]; then
-		deploy_status=$(get_conf "$status_file" "status")
-		deploy_started=$(get_conf "$status_file" "started")
-		deploy_finished=$(get_conf "$status_file" "finished")
-		deploy_pid=$(get_conf "$status_file" "pid")
-		if [ "$deploy_status" = "running" ] && [ -n "$deploy_pid" ] && ! kill -0 "$deploy_pid" 2>/dev/null; then
-			deploy_status="interrupted"
-		fi
-	fi
-
 	echo -e "\e[1m$app_name\e[0m"
-	[ -n "$active_slot" ] && echo "┆ Slot:    $active_slot"
-	if [ -n "$deploy_status" ]; then
-		local deploy_time=""
-		if [ "$deploy_status" = "running" ] && [ -n "$deploy_started" ]; then
-			deploy_time=" (since ${deploy_started:0:10} ${deploy_started:11:5})"
-		elif [ -n "$deploy_finished" ]; then
-			deploy_time=" (${deploy_finished:0:10} ${deploy_finished:11:5})"
-		fi
-		echo "┆ Deploy:  $deploy_status$deploy_time"
-	fi
 	if [ ! -f "$deploy_conf" ]; then echo "┆ Not yet deployed"; return; fi
 	if [ -n "$start_cmd" ]; then
 		echo "┆ Type:    container ($status)"
@@ -488,7 +419,7 @@ apps:info() {
 
 apps:restart() {
 	require_app "${2:-}"; local app_name=$2
-	local slot; slot=$(cat "$app_dir/active" 2>/dev/null) || die "No active slot"
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
 	step "Restarting $app_name..."
 	systemctl restart "$(app_unit "$app_name" "$slot")" || die "Failed to restart $app_name"
 	success "Restarted"
@@ -496,11 +427,11 @@ apps:restart() {
 
 apps:rollback() {
 	require_app "${2:-}"; local app_name=$2
-	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null) || die "Nothing deployed"
-	local prev_slot; prev_slot=$(other_slot "$active_slot")
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "Nothing deployed"
+	local prev_slot; prev_slot=$(other_slot "$slot")
 	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
 
-	activate_slot "$app_name" "$prev_slot" "$active_slot"
+	activate_slot "$app_name" "$prev_slot"
 	success "Rolled back $app_name"
 }
 
@@ -512,7 +443,6 @@ apps:remove() {
 		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 	fi
 	step "Removing $app_name..."
-	systemctl disable --now "deploy-watch@${app_name}.path" 2>/dev/null || true
 	teardown_slot "$app_name" "blue"
 	teardown_slot "$app_name" "green"
 	systemctl daemon-reload
@@ -546,8 +476,8 @@ domains:add() {
 	require_arg "$domain" "Usage: deploy domains add <app> <domain>"
 	check_domain_collision "$domain" "$app_name"
 	echo "$domain" >> "$app_dir/domains"
-	success "Added domain $domain to $app_name"
-	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+	cmd_apply "$app_name"
+	success "Added domain $domain"
 }
 
 domains:remove() {
@@ -555,8 +485,8 @@ domains:remove() {
 	local domain=${3:-}
 	require_arg "$domain" "Usage: deploy domains remove <app> <domain>"
 	sed -i "/^${domain}$/d" "$app_dir/domains"
-	success "Removed domain $domain from $app_name"
-	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+	cmd_apply "$app_name"
+	success "Removed domain $domain"
 }
 
 # --- env plugin ---
@@ -584,8 +514,8 @@ env:set() {
 	# replace semantics: remove existing key then append
 	sed -i "/^${key}=/d" "$app_dir/env"
 	echo "$kv" >> "$app_dir/env"
-	success "Set $key for $app_name"
-	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+	cmd_apply "$app_name"
+	success "Set $key"
 }
 
 env:remove() {
@@ -593,8 +523,8 @@ env:remove() {
 	local key=${3:-}
 	require_arg "$key" "Usage: deploy env remove <app> KEY"
 	sed -i "/^${key}=/d" "$app_dir/env"
-	success "Removed $key from $app_name"
-	systemctl start "deploy-watch@${app_name}.service" || die "Reconcile failed — run: journalctl -u deploy-watch@${app_name}.service"
+	cmd_apply "$app_name"
+	success "Removed $key"
 }
 
 # --- logs plugin ---
@@ -636,7 +566,7 @@ plugin:logs() {
 			;;
 		# --- Build logs: saved output from the build step ---
 		build)
-			local slot; slot=$(cat "$DEPLOY_ROOT/$app_name/active" 2>/dev/null) || die "No active slot"
+			local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
 			local log_file="$DEPLOY_ROOT/$app_name/$slot/build.log"
 			if [ ! -f "$log_file" ]; then die "No build log found for $app_name"; fi
 			{ if $follow; then tail -f ${num:+-n "$num"} "$log_file"
@@ -667,24 +597,17 @@ plugin:logs() {
 	esac
 }
 
-# Internal: deploy an app (called by git post-receive hook)
+# internal: deploy an app (called by git post-receive hook)
 cmd_deploy_app() {
 	require_arg "${1:-}" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 
 	# build into whichever slot isn't currently active
-	local active_slot; active_slot=$(cat "$app_dir/active" 2>/dev/null || echo "")
-	local next_slot; next_slot=$(other_slot "$active_slot")
+	local next_slot; next_slot=$(other_slot "$(active_slot "$app_name")")
 	local release_dir="$app_dir/$next_slot"
-
-	local status_file="$app_dir/deploy.status"
 	local build_log="$release_dir/build.log"
-	local start_time; start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-	printf 'status=running\nstarted=%s\npid=%s\n' "$start_time" "$$" > "$status_file"
-	_DEPLOY_STATUS_FILE="$status_file"; _DEPLOY_START_TIME="$start_time"
-	trap '_deploy_exit_trap' EXIT
 
-	step "Deploying $app_name..."
+	log "Deploying $app_name"
 	rm -rf "$release_dir"
 	local repo_dir; repo_dir=$(pwd)
 	unset GIT_DIR
@@ -694,7 +617,7 @@ cmd_deploy_app() {
 	# the dir is mounted at /build inside the build container.
 	git clone --local --quiet "$repo_dir" "$release_dir"
 	if [ -f "$release_dir/.gitmodules" ]; then
-		step "Initializing submodules..."
+		step "Initializing submodules"
 		GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$release_dir" submodule update --init --recursive
 	fi
 
@@ -707,7 +630,7 @@ cmd_deploy_app() {
 		setenv_args+=(--setenv="$env_var")
 	done < <(cat "$app_dir/env" 2>/dev/null || true)
 
-	# Container setup has three paths:
+	# container setup has three paths:
 	# 1. build + start: build in ephemeral container, which becomes the runtime container
 	# 2. build only:    build in ephemeral container, then discard it (static site)
 	# 3. start only:    clone base image as runtime container (no build step)
@@ -715,11 +638,11 @@ cmd_deploy_app() {
 		local build_dir="$app_dir/machine-build"
 		rm -rf "$build_dir"
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$build_dir"
-		step "Running build..."
+		step "Running build"
 		systemd-nspawn -D "$build_dir" "${setenv_args[@]}" --bind="$release_dir":/build --chdir=/build bash -c "$build_cmd" 2>&1 | tee "$build_log"
 		[ -n "$start_cmd" ] && mv "$build_dir" "$release_dir/machine" || rm -rf "$build_dir"
 	elif [ -n "$start_cmd" ]; then
-		step "Cloning base image..."
+		step "Cloning base image"
 		cp -a "$DEPLOY_ROOT/.internal/machine" "$release_dir/machine"
 	fi
 
@@ -728,19 +651,14 @@ cmd_deploy_app() {
 		systemd-machine-id-setup --root="$release_dir/machine"
 	fi
 
-	cmd_configure "$app_name" "$next_slot"
+	configure "$app_name" "$next_slot"
 
-	activate_slot "$app_name" "$next_slot" "$active_slot"
+	activate_slot "$app_name" "$next_slot"
 	success "Deployed $app_name"
-
-	trap - EXIT
-	local finish_time; finish_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-	printf 'status=success\nstarted=%s\nfinished=%s\n' "$start_time" "$finish_time" > "$status_file"
-	_DEPLOY_STATUS_FILE=""
 }
 
 # Internal: generate Caddy config and systemd service for a slot
-cmd_configure() {
+configure() {
 	require_arg "${1:-}" "Internal error: app name required"
 	require_arg "${2:-}" "Internal error: slot required"
 	local app_name=$1 slot=$2; local app_dir="$DEPLOY_ROOT/$app_name"
@@ -756,7 +674,7 @@ cmd_configure() {
 	local static_dir; static_dir=$(get_conf "$deploy_conf" "assets")
 	local spa_mode; spa_mode=$(get_conf "$deploy_conf" "spa")
 
-	# --- Generate Caddy config ---
+	# generate Caddy config
 	if [ -n "$domains" ]; then
 		local handler
 		if [ -z "$start_cmd" ] && [ "$spa_mode" = "true" ]; then
@@ -778,12 +696,20 @@ cmd_configure() {
 			headers+="    header $path $name $value"$'\n'
 		done < <(get_conf_all "$deploy_conf" "header")
 
-		write_app_caddy_conf "$app_dir/caddy.conf" "$domains" "$app_dir" "$slot" "$static_dir" "$headers" "$handler"
+		cat > "$app_dir/caddy.conf" <<-CADDY
+		$domains {
+		    root * $app_dir/$slot${static_dir:+/$static_dir}
+		    $headers
+		    $handler
+		        import logging "$app_dir"
+		}
+		CADDY
+		caddy fmt "$app_dir/caddy.conf" --overwrite
 	else
 		true > "$app_dir/caddy.conf"
 	fi
 
-	# --- Generate .nspawn config and start.sh ---
+	# generate .nspawn config and start.sh
 	if [ -n "$start_cmd" ]; then
 		mkdir -p "$app_dir/data"
 		printf '#!/bin/sh\n%s\n' "$start_cmd" > "$release_dir/start.sh"
@@ -854,7 +780,7 @@ cmd_help() {
 
 	System:
 	  init                Initialize the deployment system
-	  reconcile <app>     Re-apply config from domains/env files
+	  apply <app>         Apply config changes (domains, env, mounts)
 
 	Run "deploy <command> --help" for details on any command.
 
@@ -888,13 +814,12 @@ plugin_help_logs() {
 case "${1:-help}" in
 	help|--help|-h) cmd_help ;;
 	init)           cmd_init ;;
-# shortcuts → delegate to apps plugin
+	apply)          shift; cmd_apply "$@" ;;
+	deploy)         shift; cmd_deploy_app "$@" ;;
+
+	# shortcuts → delegate to apps plugin
 	create|list|info|restart|rollback|remove) load_plugin apps "$@" ;;
 
-	# internal (git hooks, systemd units, other commands)
-	_deploy-app)    shift; cmd_deploy_app "$@" ;;
-	reconcile)      shift; escalate reconcile "$@"; cmd_reconcile "$@" ;;
-
-	# try as plugin
-	*)              load_plugin "$@" ;;
+	# load plugins
+	*) load_plugin "$@" ;;
 esac
