@@ -162,7 +162,6 @@ cmd_create() {
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$app_dir"
 	chmod 2775 "$app_dir"
 	touch "$app_dir/domains" "$app_dir/env"
-	chmod 664 "$app_dir/domains" "$app_dir/env"
 
 	success "Created app: $app_name"
 	log ""

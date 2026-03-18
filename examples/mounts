@@ -3,18 +3,14 @@
 #
 # To add this command to deploy.sh:
 #
-# 1. In cmd_create, add mounts file creation:
-#      touch "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
-#      chmod 664 "$app_dir/domains" "$app_dir/env" "$app_dir/mounts"
-#
-# 2. In configure, add mount_lines before the nspawn heredoc:
+# 1. In configure, add mount_lines before the nspawn heredoc:
 #      local mount_lines=""
 #      while IFS= read -r mount; do
 #          mount_lines+="Bind=${mount}"$'\n'
 #      done < <(cat "$app_dir/mounts" 2>/dev/null || true)
 #    Then add ${mount_lines} to the [Files] section of the heredoc.
 #
-# 3. Paste everything below into deploy.sh and add a case entry:
+# 2. Paste everything below into deploy.sh and add a case entry:
 #      mounts) shift; cmd_mounts "$@" ;;
 
 cmd_mounts() {
@@ -38,6 +34,7 @@ mounts_add() {
 	local mount=${2:-}
 	require_arg "$mount" "Usage: deploy mounts add <app> <host>:<container>"
 	[[ "$mount" == *:* ]] || die "Expected host:container, got: $mount"
+	touch "$app_dir/mounts"
 	echo "$mount" >> "$app_dir/mounts"
 	cmd_apply "$app_name"
 	success "Added mount $mount"
@@ -47,6 +44,7 @@ mounts_remove() {
 	require_app "${1:-}"
 	local mount=${2:-}
 	require_arg "$mount" "Usage: deploy mounts remove <app> <host>:<container>"
+	[ -f "$app_dir/mounts" ] || return 0
 	sed -i "/^${mount}$/d" "$app_dir/mounts"
 	cmd_apply "$app_name"
 	success "Removed mount $mount"
