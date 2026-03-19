@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # deploy.sh v0.1.0 - minimal vps deployment system
 #
@@ -17,6 +17,11 @@ DEPLOY_USER=deploy
 PORT_RANGE_START=49152   # first ephemeral port
 PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
 
+# --- plugins ---
+
+declare -A COMMANDS=()
+POST_CONFIGURE_HOOKS=()
+
 # --- utilities ---
 
 red() { printf "\033[31m$1\033[0m"; }
@@ -27,13 +32,13 @@ log() { echo "$@" >&2; }              # print to stderr
 step() { log "$(dim "→") $@"; }      # print a progress step
 success() { log "$(green "✓") $@"; } # print a success message
 error() { log "$(red "✗") $@"; }     # print an error message
-die() { error "$1"; exit 1; }        # print an error and exit
+panic() { error "$1"; exit 1; }        # print an error and exit
 
-require_arg() { [ -n "${1:-}" ] || die "$2"; }
+require_arg() { [ -n "${1:-}" ] || panic "$2"; }
 
 require_app() {
 	require_arg "${1:-}" "Usage: deploy <command> <app>"
-	[ -d "$DEPLOY_ROOT/$1" ] || die "App $1 does not exist"
+	[ -d "$DEPLOY_ROOT/$1" ] || panic "App $1 does not exist"
 	app_name="$1"; app_dir="$DEPLOY_ROOT/$1"
 }
 
@@ -67,7 +72,7 @@ check_domain_collision() {
 		[ -f "$domains_file" ] || continue
 		local app_name; app_name=$(basename "$(dirname "$domains_file")")
 		[ "$app_name" = "$exclude_app" ] && continue
-		grep -qx "$domain" "$domains_file" 2>/dev/null && die "Domain $domain already used by $app_name"
+		grep -qx "$domain" "$domains_file" 2>/dev/null && panic "Domain $domain already used by $app_name"
 	done
 }
 
@@ -112,7 +117,7 @@ activate_slot() {
 		systemctl start "$(app_unit "$app_name" "$new_slot")"
 		if ! wait_for_port "$port"; then
 			teardown_slot "$app_name" "$new_slot"
-			die "Instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
+			panic "Instance failed to start on port $port after ${PORT_WAIT_SECONDS}s"
 		fi
 		teardown_slot "$app_name" "$(other_slot "$new_slot")"
 	fi
@@ -131,7 +136,7 @@ teardown_slot() {
 
 # Re-configure and restart the active slot.
 # No-op if app hasn't been deployed yet.
-cmd_apply() {
+cmd:apply() {
 	escalate apply "$@"
 	local app_name=$1
 	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || return 0
@@ -143,12 +148,12 @@ cmd_apply() {
 	reload_caddy
 }
 
-cmd_create() {
+cmd:create() {
 	escalate create "$@"
 	require_arg "${1:-}" "Usage: deploy create <app>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
-	if [[ "$app_name" == .* ]]; then die "App name cannot start with '.'"; fi
-	if [ -d "$app_dir" ]; then die "App $app_name already exists"; fi
+	if [[ "$app_name" == .* ]]; then panic "App name cannot start with '.'"; fi
+	if [ -d "$app_dir" ]; then panic "App $app_name already exists"; fi
 
 	step "Creating app: $app_name"
 	mkdir -p "$app_dir"/repo.git
@@ -171,7 +176,7 @@ cmd_create() {
 	log ""
 }
 
-cmd_list() {
+cmd:list() {
 	escalate list
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		[ -d "$app_dir" ] || continue
@@ -180,7 +185,7 @@ cmd_list() {
 	done
 }
 
-cmd_info() {
+cmd:info() {
 	escalate info "$@"
 	require_app "${1:-}"; local app_name=$1
 	local slot; slot=$(active_slot "$app_name")
@@ -210,27 +215,27 @@ cmd_info() {
 	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
 }
 
-cmd_restart() {
+cmd:restart() {
 	escalate restart "$@"
 	require_app "${1:-}"; local app_name=$1
-	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "No active slot"
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || panic "No active slot"
 	step "Restarting $app_name..."
-	systemctl restart "$(app_unit "$app_name" "$slot")" || die "Failed to restart $app_name"
+	systemctl restart "$(app_unit "$app_name" "$slot")" || panic "Failed to restart $app_name"
 	success "Restarted"
 }
 
-cmd_rollback() {
+cmd:rollback() {
 	escalate rollback "$@"
 	require_app "${1:-}"; local app_name=$1
-	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || die "Nothing deployed"
+	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || panic "Nothing deployed"
 	local prev_slot; prev_slot=$(other_slot "$slot")
-	[ -d "$app_dir/$prev_slot" ] || die "No previous release to roll back to"
+	[ -d "$app_dir/$prev_slot" ] || panic "No previous release to roll back to"
 
 	activate_slot "$app_name" "$prev_slot"
 	success "Rolled back $app_name"
 }
 
-cmd_remove() {
+cmd:remove() {
 	escalate remove "$@"
 	require_app "${1:-}"; local app_name=$1
 	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
@@ -250,90 +255,92 @@ cmd_remove() {
 	success "Removed $app_name"
 }
 
-cmd_domains() {
+# --- domains ---
+
+cmd:domains() {
 	escalate domains "$@"
-	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	local subcmd="${1:-list}"; shift || true
 	case "$subcmd" in
-		list)   domains_list "$@" ;;
-		add)    domains_add "$@" ;;
-		remove) domains_remove "$@" ;;
-		*)      die "Usage: deploy domains [list|add|remove] <app> [domain]" ;;
+		list)   cmd:domains:list "$@" ;;
+		add)    cmd:domains:add "$@" ;;
+		remove) cmd:domains:remove "$@" ;;
+		*)      panic "Usage: deploy domains [list|add|remove] <app> [domain]" ;;
 	esac
 }
 
-domains_list() {
+cmd:domains:list() {
 	require_app "${1:-}"
 	cat "$app_dir/domains" 2>/dev/null || true
 }
 
-domains_add() {
+cmd:domains:add() {
 	require_app "${1:-}"
 	local domain=${2:-}
 	require_arg "$domain" "Usage: deploy domains add <app> <domain>"
 	check_domain_collision "$domain" "$app_name"
 	echo "$domain" >> "$app_dir/domains"
-	cmd_apply "$app_name"
+	cmd:apply "$app_name"
 	success "Added domain $domain"
 }
 
-domains_remove() {
+cmd:domains:remove() {
 	require_app "${1:-}"
 	local domain=${2:-}
 	require_arg "$domain" "Usage: deploy domains remove <app> <domain>"
 	sed -i "/^${domain}$/d" "$app_dir/domains"
-	cmd_apply "$app_name"
+	cmd:apply "$app_name"
 	success "Removed domain $domain"
 }
 
-cmd_env() {
+cmd:env() {
 	escalate env "$@"
-	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	local subcmd="${1:-list}"; shift || true
 	case "$subcmd" in
-		list)   env_list "$@" ;;
-		set)    env_set "$@" ;;
-		remove) env_remove "$@" ;;
-		*)      die "Usage: deploy env [list|set|remove] <app> [KEY=value]" ;;
+		list)   cmd:env:list "$@" ;;
+		set)    cmd:env:set "$@" ;;
+		remove) cmd:env:remove "$@" ;;
+		*)      panic "Usage: deploy env [list|set|remove] <app> [KEY=value]" ;;
 	esac
 }
 
-env_list() {
+cmd:env:list() {
 	require_app "${1:-}"
 	cat "$app_dir/env" 2>/dev/null || true
 }
 
-env_set() {
+cmd:env:set() {
 	require_app "${1:-}"
 	local kv=${2:-}
 	require_arg "$kv" "Usage: deploy env set <app> KEY=value"
-	[[ "$kv" == *=* ]] || die "Expected KEY=value, got: $kv"
+	[[ "$kv" == *=* ]] || panic "Expected KEY=value, got: $kv"
 	local key="${kv%%=*}"
 	sed -i "/^${key}=/d" "$app_dir/env"
 	echo "$kv" >> "$app_dir/env"
-	cmd_apply "$app_name"
+	cmd:apply "$app_name"
 	success "Set $key"
 }
 
-env_remove() {
+cmd:env:remove() {
 	require_app "${1:-}"
 	local key=${2:-}
 	require_arg "$key" "Usage: deploy env remove <app> KEY"
 	sed -i "/^${key}=/d" "$app_dir/env"
-	cmd_apply "$app_name"
+	cmd:apply "$app_name"
 	success "Removed $key"
 }
 
-cmd_logs() {
+cmd:logs() {
 	escalate logs "$@"
 	require_arg "${1:-}" "Usage: deploy logs <app> [-f] [-n N]"
 	local app_name=$1; shift
-	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then die "App $app_name does not exist"; fi
+	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then panic "App $app_name does not exist"; fi
 
 	local follow=false num=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			-f|--follow) follow=true ;;
 			-n)          shift; num=$1 ;;
-			*)           die "Unknown option: $1" ;;
+			*)           panic "Unknown option: $1" ;;
 		esac
 		shift
 	done
@@ -345,11 +352,13 @@ cmd_logs() {
 }
 
 # initialize the deployment system
-cmd_init() {
-	if [ "$(id -u)" -ne 0 ]; then die "deploy init must be run as root"; fi
-	step "Setting up deploy.sh at $DEPLOY_ROOT..."
+cmd:init() {
+	if [ "$(id -u)" -ne 0 ]; then panic "deploy init must be run as root"; fi
+	log "Setting up deploy.sh at $DEPLOY_ROOT"
 
-	# install system dependencies (including caddy from its official repo)
+
+	# install system dependencies
+	step "Installing system dependencies..."
 	if command -v apt-get &>/dev/null; then
 		apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
 		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -364,13 +373,14 @@ cmd_init() {
 		dnf copr enable -y @caddy/caddy
 		dnf install -y caddy systemd-container
 	else
-		die "Unsupported package manager — install caddy and systemd-container manually"
+		panic "Unsupported package manager — install caddy and systemd-container manually"
 	fi
 
 	# create deploy user
-	id "$DEPLOY_USER" &>/dev/null || { useradd -m -s /bin/bash "$DEPLOY_USER"; success "Created $DEPLOY_USER user"; }
+	id "$DEPLOY_USER" &>/dev/null || { step "Creating $DEPLOY_USER user..."; useradd -m -s /bin/bash "$DEPLOY_USER" }
 
 	# copy SSH keys
+	step "Copying SSH authorized_keys..."
 	local src_keys=""
 	if [ -n "$SUDO_USER" ]; then
 		local src_home; src_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
@@ -383,7 +393,6 @@ cmd_init() {
 		cp "$src_keys" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 		chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
 		chmod 700 "/home/$DEPLOY_USER/.ssh" && chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
-		success "Copied SSH authorized_keys from $src_keys"
 	fi
 
 	# create deploy directory
@@ -393,20 +402,17 @@ cmd_init() {
 
 	# pull Alpine base image
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
-		step "Pulling Alpine base image..."
-		local arch; arch=$(uname -m)
-		local alpine_file; alpine_file=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/latest-releases.yaml" | grep -oE "alpine-minirootfs-[0-9]+\.[0-9]+\.[0-9]+-${arch}\.tar\.gz" | head -1)
-		if [ -z "$alpine_file" ]; then die "Could not find Alpine minirootfs for $arch"; fi
+		local version="3.23.3"; local arch; arch=$(uname -m)
 		mkdir -p "$DEPLOY_ROOT/.internal/machine"
-		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/$alpine_file" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
+		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/alpine-minirootfs-${version}-${arch}.tar.gz" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
 		systemd-nspawn -D "$DEPLOY_ROOT/.internal/machine" /bin/sh -c "apk update && apk add --no-cache bash"
-		success "Base image ready"
+		step "Pulled Alpine base image"
 	fi
 
 	# create Caddyfile
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
-		if [ -z "$acme_email" ]; then die "Email is required for HTTPS certificate provisioning"; fi
+		if [ -z "$acme_email" ]; then panic "Email is required for HTTPS certificate provisioning"; fi
 		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
@@ -486,7 +492,7 @@ cmd_init() {
 }
 
 # deploy an app (called by git post-receive hook)
-cmd_deploy() {
+cmd:deploy() {
 	require_arg "${1:-}" "Internal error: app name required"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 
@@ -545,7 +551,7 @@ cmd_deploy() {
 	success "Deployed $app_name"
 }
 
-# Internal: generate Caddy config and systemd service for a slot
+# internal: generate Caddy config and systemd service for a slot
 configure() {
 	require_arg "${1:-}" "Internal error: app name required"
 	require_arg "${2:-}" "Internal error: slot required"
@@ -621,10 +627,11 @@ configure() {
 		NSPAWN
 	fi
 
+	for hook in "${POST_CONFIGURE_HOOKS[@]}"; do "$hook" "$app_name" "$release_dir"; done
 	success "Configured"
 }
 
-cmd_help() {
+cmd:help() {
 	cat <<-HELP
 	deploy.sh — minimal VPS deployment system
 
@@ -658,19 +665,27 @@ cmd_help() {
 	HELP
 }
 
-case "${1:-help}" in
-	help|--help|-h) cmd_help ;;
-	init)           cmd_init ;;
-	apply)          shift; cmd_apply "$@" ;;
-	deploy)         shift; cmd_deploy "$@" ;;
-	create)         shift; cmd_create "$@" ;;
-	list)           cmd_list ;;
-	info)           shift; cmd_info "$@" ;;
-	restart)        shift; cmd_restart "$@" ;;
-	rollback)       shift; cmd_rollback "$@" ;;
-	remove)         shift; cmd_remove "$@" ;;
-	domains)        shift; cmd_domains "$@" ;;
-	env)            shift; cmd_env "$@" ;;
-	logs)           shift; cmd_logs "$@" ;;
-	*)              die "Unknown command: $1. Run \"deploy help\" for usage" ;;
+# source plugins from $DEPLOY_ROOT/.plugins/
+for _plugin in "$DEPLOY_ROOT/.plugins/"*; do [ -f "$_plugin" ] && source "$_plugin"; done
+
+cmd="${1:-help}"; shift || true;
+case $cmd in
+	help|--help|-h) cmd:help "$@" ;;
+	init)           cmd:init "$@" ;;
+	apply)          cmd:apply "$@" ;;
+	deploy)         cmd:deploy "$@" ;;
+	create)         cmd:create "$@" ;;
+	list)           cmd:list "$@" ;;
+	info)           cmd:info "$@" ;;
+	restart)        cmd:restart "$@" ;;
+	rollback)       cmd:rollback "$@" ;;
+	remove)         cmd:remove "$@" ;;
+	domains)        cmd:domains "$@" ;;
+	env)            cmd:env "$@" ;;
+	logs)           cmd:logs "$@" ;;
+	*)
+		fn="${COMMANDS[$cmd]:-}"
+		[ -n "$fn" ] && "$fn" "$@" \
+			|| panic "Unknown command: $cmd. Run \"deploy help\" for usage"
+		;;
 esac

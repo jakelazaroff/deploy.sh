@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# deploy.sh v0.1.0 - minimal vps deployment system
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this#
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Jake Lazaroff https://github.com/jakelazaroff/deploy.sh
+
+# Manage SSH deploy keys for an app
+#
+# To add this command, copy this file to $DEPLOY_ROOT/.plugins/mounts
+
+
+COMMANDS[mounts]=cmd:mounts
+cmd:mounts() {
+	escalate mounts "$@"
+	local subcmd="${1:-list}"; shift 2>/dev/null || true
+	case "$subcmd" in
+		list)   cmd:mounts:list "$@" ;;
+		add)    cmd:mounts:add "$@" ;;
+		remove) cmd:mounts:remove "$@" ;;
+		*)      die "Usage: deploy mounts [list|add|remove] <app> [host:container]" ;;
+	esac
+}
+
+cmd:mounts:list() {
+	require_app "${1:-}"
+	cat "$app_dir/mounts" 2>/dev/null || true
+}
+
+cmd:mounts:add() {
+	require_app "${1:-}"
+	local mount=${2:-}
+	require_arg "$mount" "Usage: deploy mounts add <app> <host>:<container>"
+	[[ "$mount" == *:* ]] || die "Expected host:container, got: $mount"
+	touch "$app_dir/mounts"
+	echo "$mount" >> "$app_dir/mounts"
+	cmd:apply "$app_name"
+	success "Added mount $mount"
+}
+
+cmd:mounts:remove() {
+	require_app "${1:-}"
+	local mount=${2:-}
+	require_arg "$mount" "Usage: deploy mounts remove <app> <host>:<container>"
+	[ -f "$app_dir/mounts" ] || return 0
+	sed -i "/^${mount}$/d" "$app_dir/mounts"
+	cmd:apply "$app_name"
+	success "Removed mount $mount"
+}
+
+POST_CONFIGURE_HOOKS+=(mounts_post_configure)
+mounts_post_configure() {
+	local app_name=$1 release_dir=$2
+	local app_dir="$DEPLOY_ROOT/$app_name"
+	[ -f "$app_dir/mounts" ] || return 0
+	[ -f "$release_dir/machine.nspawn" ] || return 0
+	while IFS= read -r mount; do
+		printf 'Bind=%s\n' "$mount" >> "$release_dir/machine.nspawn"
+	done < "$app_dir/mounts"
+}

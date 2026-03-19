@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# Example: keys — Manage SSH deploy keys for an app
 #
-# To add this command to deploy.sh, paste everything below into deploy.sh
-# and add a case entry:  keys) shift; cmd_keys "$@" ;;
+# deploy.sh v0.1.0 - minimal vps deployment system
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this#
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Copyright (c) 2026 Jake Lazaroff https://github.com/jakelazaroff/deploy.sh
 
-cmd_keys() {
+# Manage SSH deploy keys for an app
+#
+# To add this command, copy this file to $DEPLOY_ROOT/.plugins/keys
+
+COMMANDS[keys]=cmd:keys
+cmd:keys() {
 	escalate keys "$@"
 	local subcmd="${1:-list}"; shift 2>/dev/null || true
 	case "$subcmd" in
