@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 #
-# deploy.sh v0.1.0 - minimal vps deployment system
-#
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this#
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -10,17 +8,16 @@
 
 # Manage SSH deploy keys for an app
 #
-# To add this command, copy this file to $DEPLOY_ROOT/.plugins/keys
+# To add this plugin, copy this file to $DEPLOY_ROOT/.plugins/keys
 
 COMMANDS[keys]=cmd:keys
 cmd:keys() {
-	escalate keys "$@"
 	local subcmd="${1:-list}"; shift 2>/dev/null || true
 	case "$subcmd" in
-		list)     keys_list "$@" ;;
-		add)      keys_add "$@" ;;
-		remove)   keys_remove "$@" ;;
-		generate) keys_generate "$@" ;;
+		list)     keys:list "$@" ;;
+		add)      keys:add "$@" ;;
+		remove)   keys:remove "$@" ;;
+		generate) keys:generate "$@" ;;
 		*)        die "Usage: deploy keys [list|add|remove|generate] <app> [key-name]" ;;
 	esac
 }
@@ -29,7 +26,7 @@ _key_fingerprint() {
 	echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}'
 }
 
-keys_list() {
+keys:list() {
 	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 	local found=false
@@ -43,7 +40,7 @@ keys_list() {
 	$found || log "(no deploy keys for $app_name)"
 }
 
-keys_add() {
+keys:add() {
 	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 	require_arg "${2:-}" "Usage: deploy keys add <app> <key-name> [public-key]"
@@ -58,7 +55,7 @@ keys_add() {
 	success "Added deploy key '$key_name' for $app_name: $(_key_fingerprint "$normalized")"
 }
 
-keys_remove() {
+keys:remove() {
 	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 	require_arg "${2:-}" "Usage: deploy keys remove <app> <key-name>"
@@ -80,7 +77,7 @@ keys_remove() {
 	fi
 }
 
-keys_generate() {
+keys:generate() {
 	require_app "${1:-}"
 	local auth_keys="/home/$DEPLOY_USER/.ssh/authorized_keys"
 	require_arg "${2:-}" "Usage: deploy keys generate <app> <key-name>"

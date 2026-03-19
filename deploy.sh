@@ -16,6 +16,7 @@ DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
 PORT_RANGE_START=49152   # first ephemeral port
 PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
+ALPINE_VERSION=3.23.3
 
 # --- plugins ---
 
@@ -137,7 +138,6 @@ teardown_slot() {
 # Re-configure and restart the active slot.
 # No-op if app hasn't been deployed yet.
 cmd:apply() {
-	escalate apply "$@"
 	local app_name=$1
 	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || return 0
 	configure "$app_name" "$slot"
@@ -149,7 +149,6 @@ cmd:apply() {
 }
 
 cmd:create() {
-	escalate create "$@"
 	require_arg "${1:-}" "Usage: deploy create <app>"
 	local app_name=$1; local app_dir="$DEPLOY_ROOT/$app_name"
 	if [[ "$app_name" == .* ]]; then panic "App name cannot start with '.'"; fi
@@ -177,7 +176,6 @@ cmd:create() {
 }
 
 cmd:list() {
-	escalate list
 	for app_dir in "$DEPLOY_ROOT"/*/; do
 		[ -d "$app_dir" ] || continue
 		[[ "$(basename "$app_dir")" == .* ]] && continue
@@ -186,7 +184,6 @@ cmd:list() {
 }
 
 cmd:info() {
-	escalate info "$@"
 	require_app "${1:-}"; local app_name=$1
 	local slot; slot=$(active_slot "$app_name")
 	local deploy_conf="$app_dir/$slot/deploy.conf"
@@ -216,16 +213,14 @@ cmd:info() {
 }
 
 cmd:restart() {
-	escalate restart "$@"
 	require_app "${1:-}"; local app_name=$1
 	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || panic "No active slot"
-	step "Restarting $app_name..."
+	step "Restarting $app_name"
 	systemctl restart "$(app_unit "$app_name" "$slot")" || panic "Failed to restart $app_name"
 	success "Restarted"
 }
 
 cmd:rollback() {
-	escalate rollback "$@"
 	require_app "${1:-}"; local app_name=$1
 	local slot; slot=$(active_slot "$app_name"); [ -n "$slot" ] || panic "Nothing deployed"
 	local prev_slot; prev_slot=$(other_slot "$slot")
@@ -236,20 +231,17 @@ cmd:rollback() {
 }
 
 cmd:remove() {
-	escalate remove "$@"
 	require_app "${1:-}"; local app_name=$1
 	local force=false; [[ "${2:-}" == "-f" || "${2:-}" == "--force" ]] && force=true
 	if ! $force; then
 		read -rp "Remove $app_name? This will delete all app files. Type 'yes' to confirm: " confirm
 		if [ "$confirm" != "yes" ]; then log "Aborted."; exit 1; fi
 	fi
-	step "Removing $app_name..."
+	step "Removing $app_name"
 	teardown_slot "$app_name" "blue"
 	teardown_slot "$app_name" "green"
 	systemctl daemon-reload
-	local ports_file="$DEPLOY_ROOT/.internal/ports"
-	if [ -f "$ports_file" ]; then sed -i "/^${app_name}--/d" "$ports_file"; fi
-	step "Removing app files..."
+	step "Removing app files"
 	rm -rf "$app_dir"
 	reload_caddy
 	success "Removed $app_name"
@@ -258,7 +250,6 @@ cmd:remove() {
 # --- domains ---
 
 cmd:domains() {
-	escalate domains "$@"
 	local subcmd="${1:-list}"; shift || true
 	case "$subcmd" in
 		list)   cmd:domains:list "$@" ;;
@@ -293,7 +284,6 @@ cmd:domains:remove() {
 }
 
 cmd:env() {
-	escalate env "$@"
 	local subcmd="${1:-list}"; shift || true
 	case "$subcmd" in
 		list)   cmd:env:list "$@" ;;
@@ -330,7 +320,6 @@ cmd:env:remove() {
 }
 
 cmd:logs() {
-	escalate logs "$@"
 	require_arg "${1:-}" "Usage: deploy logs <app> [-f] [-n N]"
 	local app_name=$1; shift
 	if [ ! -d "$DEPLOY_ROOT/$app_name" ]; then panic "App $app_name does not exist"; fi
@@ -358,7 +347,7 @@ cmd:init() {
 
 
 	# install system dependencies
-	step "Installing system dependencies..."
+	step "Installing system dependencies"
 	if command -v apt-get &>/dev/null; then
 		apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
 		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -377,10 +366,10 @@ cmd:init() {
 	fi
 
 	# create deploy user
-	id "$DEPLOY_USER" &>/dev/null || { step "Creating $DEPLOY_USER user..."; useradd -m -s /bin/bash "$DEPLOY_USER" }
+	id "$DEPLOY_USER" &>/dev/null || { step "Creating $DEPLOY_USER user"; useradd -m -s /bin/bash "$DEPLOY_USER" }
 
 	# copy SSH keys
-	step "Copying SSH authorized_keys..."
+	step "Copying SSH authorized_keys"
 	local src_keys=""
 	if [ -n "$SUDO_USER" ]; then
 		local src_home; src_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
@@ -396,23 +385,24 @@ cmd:init() {
 	fi
 
 	# create deploy directory
-	mkdir -p "$DEPLOY_ROOT/.internal"
+	mkdir -p "$DEPLOY_ROOT/{.internal,.plugins}"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 	chmod 2775 "$DEPLOY_ROOT"
 
 	# pull Alpine base image
 	if [ ! -d "$DEPLOY_ROOT/.internal/machine" ]; then
-		local version="3.23.3"; local arch; arch=$(uname -m)
+		step "Pulling Alpine base image"
+		local arch; arch=$(uname -m)
 		mkdir -p "$DEPLOY_ROOT/.internal/machine"
-		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/alpine-minirootfs-${version}-${arch}.tar.gz" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
+		curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$arch/alpine-minirootfs-${ALPINE_VERSION}-${arch}.tar.gz" | tar -xz -C "$DEPLOY_ROOT/.internal/machine"
 		systemd-nspawn -D "$DEPLOY_ROOT/.internal/machine" /bin/sh -c "apk update && apk add --no-cache bash"
-		step "Pulled Alpine base image"
 	fi
 
 	# create Caddyfile
 	if [ ! -f "$DEPLOY_ROOT/.internal/Caddyfile" ]; then
 		read -rp "📧 Email for Let's Encrypt certificates: " acme_email
 		if [ -z "$acme_email" ]; then panic "Email is required for HTTPS certificate provisioning"; fi
+		step "Configuring Caddy"
 		cat > "$DEPLOY_ROOT/.internal/Caddyfile" <<-CADDY
 		{
 		    email $acme_email
@@ -480,13 +470,13 @@ cmd:init() {
 	systemctl daemon-reload
 
 	# set up sudoers
+	step "Setting up sudoers"
 	cat > /etc/sudoers.d/deploy <<-SUDOERS
 	Defaults env_keep += "SSH_AUTH_SOCK"
 	$DEPLOY_USER ALL=(root) NOPASSWD: /usr/local/bin/deploy *
 	ALL ALL=(deploy) NOPASSWD: /usr/local/bin/deploy *
 	SUDOERS
 	chmod 0440 /etc/sudoers.d/deploy
-	success "Created /etc/sudoers.d/deploy"
 
 	success "deploy.sh initialized"
 }
@@ -563,7 +553,7 @@ configure() {
 	local d; for d in $domains; do check_domain_collision "$d" "$app_name"; done
 	local port; port=$(assign_port "$app_name" "$slot")
 
-	step "Configuring $app_name..."
+	step "Configuring $app_name"
 
 	local static_dir; static_dir=$(get_conf "$deploy_conf" "assets")
 	local spa_mode; spa_mode=$(get_conf "$deploy_conf" "spa")
@@ -668,7 +658,8 @@ cmd:help() {
 # source plugins from $DEPLOY_ROOT/.plugins/
 for _plugin in "$DEPLOY_ROOT/.plugins/"*; do [ -f "$_plugin" ] && source "$_plugin"; done
 
-cmd="${1:-help}"; shift || true;
+cmd="${1:-help}"; shift || true
+case "$cmd" in help|--help|-h) ;; *) escalate "$cmd" "$@" ;; esac
 case $cmd in
 	help|--help|-h) cmd:help "$@" ;;
 	init)           cmd:init "$@" ;;
