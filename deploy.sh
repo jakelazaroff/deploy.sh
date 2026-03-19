@@ -365,8 +365,9 @@ cmd:init() {
 		panic "Unsupported package manager — install caddy and systemd-container manually"
 	fi
 
-	# create deploy user
-	id "$DEPLOY_USER" &>/dev/null || { step "Creating $DEPLOY_USER user"; useradd -m -s /bin/bash "$DEPLOY_USER" }
+	# create deploy user; add caddy to the deploy group so it can write access logs
+	id "$DEPLOY_USER" &>/dev/null || { step "Creating $DEPLOY_USER user"; useradd -m -s /bin/bash "$DEPLOY_USER"; }
+	id caddy &>/dev/null && usermod -aG "$DEPLOY_USER" caddy
 
 	# copy SSH keys
 	step "Copying SSH authorized_keys"
@@ -385,7 +386,7 @@ cmd:init() {
 	fi
 
 	# create deploy directory
-	mkdir -p "$DEPLOY_ROOT/{.internal,.plugins}"
+	mkdir -p "$DEPLOY_ROOT/.internal" "$DEPLOY_ROOT/.plugins"
 	chown -R "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_ROOT"
 	chmod 2775 "$DEPLOY_ROOT"
 
@@ -438,7 +439,6 @@ cmd:init() {
 
 		import $DEPLOY_ROOT/*/caddy.conf
 		CADDY
-		success "Created Caddyfile"
 	fi
 
 	# override caddy's service to use our Caddyfile
