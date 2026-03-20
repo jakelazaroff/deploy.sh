@@ -129,7 +129,9 @@ activate_slot() {
 teardown_slot() {
 	local app_name=$1 slot=$2
 	[ -n "$slot" ] || return 0
-	systemctl stop "$(app_unit "$app_name" "$slot")" 2>/dev/null || true
+	local unit; unit=$(app_unit "$app_name" "$slot")
+	systemctl stop "$unit" 2>/dev/null || true
+	systemctl reset-failed "$unit" 2>/dev/null || true
 	sed -i "/^${app_name}--${slot}=/d" "$DEPLOY_ROOT/.internal/ports"
 }
 
@@ -616,8 +618,6 @@ configure() {
 	fi
 
 	for hook in "${POST_CONFIGURE_HOOKS[@]}"; do "$hook" "$app_name" "$release_dir"; done
-
-	success "Configured"
 }
 
 cmd:help() {
