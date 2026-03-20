@@ -114,6 +114,7 @@ activate_slot() {
 	local app_name=$1 new_slot=$2
 	local start_cmd; start_cmd=$(get_conf "$DEPLOY_ROOT/$app_name/$new_slot/deploy.conf" "start")
 	if [ -n "$start_cmd" ]; then
+		step "Activating slot"
 		local port; port=$(assign_port "$app_name" "$new_slot")
 		systemctl start "$(app_unit "$app_name" "$new_slot")"
 		if ! wait_for_port "$port"; then
@@ -129,6 +130,7 @@ activate_slot() {
 teardown_slot() {
 	local app_name=$1 slot=$2
 	[ -n "$slot" ] || return 0
+	stpe "Tearing down slot"
 	local unit; unit=$(app_unit "$app_name" "$slot")
 	systemctl stop "$unit" 2>/dev/null || true
 	systemctl reset-failed "$unit" 2>/dev/null || true
