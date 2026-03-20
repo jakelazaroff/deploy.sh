@@ -14,9 +14,9 @@ set -euo pipefail
 
 DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
-PORT_RANGE_START=49152   # first ephemeral port
-PORT_WAIT_SECONDS=30     # how long to wait for a new container to start
 ALPINE_VERSION=3.23.3
+PORT_RANGE_START=49152 # first ephemeral port
+PORT_WAIT_SECONDS=30 # how long to wait for a new container to start
 
 # --- plugins ---
 
@@ -461,7 +461,7 @@ cmd:init() {
 
 	[Service]
 	Type=simple
-	ExecStart=/usr/bin/systemd-nspawn --quiet --machine=%i -D $DEPLOY_ROOT%f/machine
+	ExecStart=/usr/bin/systemd-nspawn --quiet --settings=trusted --machine=%i -D $DEPLOY_ROOT%f/machine bash /app/start.sh
 	Restart=on-failure
 	KillMode=mixed
 	SERVICE
@@ -493,13 +493,12 @@ cmd:deploy() {
 
 	log "Deploying $app_name"
 	rm -rf "$release_dir"
-	local repo_dir; repo_dir=$(pwd)
 	unset GIT_DIR
 	# Clone rather than checkout so that .git lives inside the release dir. This
 	# keeps all git metadata (gitdir pointers, core.worktree, submodule configs)
 	# self-relative to the release dir, which means they resolve correctly when
 	# the dir is mounted at /build inside the build container.
-	git clone --local --quiet "$repo_dir" "$release_dir"
+	git clone --local --quiet "$app_dir/repo.git" "$release_dir"
 	if [ -f "$release_dir/.gitmodules" ]; then
 		step "Initializing submodules"
 		GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" git -C "$release_dir" submodule update --init --recursive
@@ -607,7 +606,6 @@ configure() {
 		cat > "$release_dir/machine.nspawn" <<-NSPAWN
 		[Exec]
 		WorkingDirectory=/app
-		Parameters=bash /app/start.sh
 		Environment=PORT=$port
 		${env_lines}
 		[Files]
@@ -618,6 +616,7 @@ configure() {
 	fi
 
 	for hook in "${POST_CONFIGURE_HOOKS[@]}"; do "$hook" "$app_name" "$release_dir"; done
+
 	success "Configured"
 }
 
