@@ -213,9 +213,9 @@ cmd:info() {
 	else
 		echo "┆ Type:    static"
 	fi
-	[ -n "$domains_list" ] && echo "┆ Domain:  $(echo "$domains_list" | tr '\n' ' ')"
-	[ -n "$assets" ] && echo "┆ Assets:  $assets"
-	[ "$spa" = "true" ] && echo "┆ SPA:     yes"
+	if [ -n "$domains_list" ]; then echo "┆ Domain:  $(echo "$domains_list" | tr '\n' ' ')"; fi
+	if [ -n "$assets" ]; then echo "┆ Assets:  $assets"; fi
+	if [ "$spa" = "true" ]; then echo "┆ SPA:     yes"; fi
 }
 
 cmd:restart() {
