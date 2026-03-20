@@ -495,7 +495,7 @@ cmd:deploy() {
 	# build into whichever slot isn't currently active
 	local next_slot; next_slot=$(other_slot "$(active_slot "$app_name")")
 	local release_dir="$app_dir/$next_slot"
-	local build_log="$release_dir/build.log"
+	local build_log="$app_dir/build.log"
 
 	log "Deploying $app_name"
 	rm -rf "$release_dir"
