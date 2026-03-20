@@ -11,6 +11,8 @@
 # Install: curl -fsSL https://raw.githubusercontent.com/jakelazaroff/deploy.sh/refs/heads/main/deploy.sh -o /usr/local/bin/deploy && chmod +x /usr/local/bin/deploy
 
 set -euo pipefail
+set -E
+trap 'echo "deploy.sh: error on line $LINENO: $BASH_COMMAND" >&2' ERR
 
 DEPLOY_ROOT=/srv/deploy
 DEPLOY_USER=deploy
@@ -56,7 +58,7 @@ escalate() {
 get_conf() {
 	local file=$1 key=$2 default=${3:-}
 	if [ ! -f "$file" ]; then echo "$default"; return; fi
-	local value; value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2-)
+	local value; value=$(grep "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true)
 	echo "${value:-$default}"
 }
 
@@ -73,7 +75,7 @@ check_domain_collision() {
 		[ -f "$domains_file" ] || continue
 		local app_name; app_name=$(basename "$(dirname "$domains_file")")
 		[ "$app_name" = "$exclude_app" ] && continue
-		grep -qx "$domain" "$domains_file" 2>/dev/null && panic "Domain $domain already used by $app_name"
+		if grep -qx "$domain" "$domains_file" 2>/dev/null; then panic "Domain $domain already used by $app_name"; fi
 	done
 }
 
@@ -100,7 +102,7 @@ assign_port() {
 	local ports_file="$DEPLOY_ROOT/.internal/ports"
 	(
 		flock -x 9
-		local existing; existing=$(grep "^$key=" "$ports_file" 2>/dev/null | cut -d= -f2)
+		local existing; existing=$(grep "^$key=" "$ports_file" 2>/dev/null | cut -d= -f2 || true)
 		if [ -n "$existing" ]; then echo "$existing"; exit 0; fi
 		local port=$PORT_RANGE_START
 		while grep -q "=$port$" "$ports_file" 2>/dev/null; do ((port++)); done
@@ -130,7 +132,7 @@ activate_slot() {
 teardown_slot() {
 	local app_name=$1 slot=$2
 	[ -n "$slot" ] || return 0
-	stpe "Tearing down slot"
+	step "Tearing down slot"
 	local unit; unit=$(app_unit "$app_name" "$slot")
 	systemctl stop "$unit" 2>/dev/null || true
 	systemctl reset-failed "$unit" 2>/dev/null || true
@@ -535,7 +537,6 @@ cmd:deploy() {
 
 	if [ -n "$start_cmd" ]; then
 		rm -f "$release_dir/machine/etc/machine-id"
-		systemd-machine-id-setup --root="$release_dir/machine"
 	fi
 
 	configure "$app_name" "$next_slot"
@@ -620,6 +621,11 @@ configure() {
 	fi
 
 	for hook in "${POST_CONFIGURE_HOOKS[@]}"; do "$hook" "$app_name" "$release_dir"; done
+
+	# rename to the machine name so systemd-nspawn finds it via --machine= parent-dir lookup
+	if [ -n "$start_cmd" ]; then
+		mv "$release_dir/machine.nspawn" "$release_dir/$(systemd-escape -p "/${app_name}/${slot}").nspawn"
+	fi
 }
 
 cmd:help() {
