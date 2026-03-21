@@ -12,7 +12,7 @@ Featuring…
 
 ## Why deploy.sh?
 
-deploy.sh is significantly less powerful than other open source PaaS options like [Coolify](https://coolify.io) and [Dokku](https://dokku.com). Those apps give you things like database backups, access control,. monitoring — at the cost of tens (or hundreds!) of thousands of lines of server-side code and dependencies that must be installed and maintained.
+deploy.sh is significantly less powerful than other open source PaaS options like [Coolify](https://coolify.io) and [Dokku](https://dokku.com). Those apps give you things like database backups, access control, monitoring… at the cost of tens (or hundreds!) of thousands of lines of server-side code and dependencies that must be installed and maintained.
 
 On the other hand, deploy.sh is a single ~700 line Bash script that you can read, debug and customize to fit your needs. Under the hood, it's a thin wrapper over software that's (mostly) already installed on your system: [Git](https://git-scm.com), [Caddy](https://caddyserver.com)[^nginx] and [systemd-nspawn](https://www.man7.org/linux/man-pages/man1/systemd-nspawn.1.html).
 
