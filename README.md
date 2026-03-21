@@ -12,7 +12,7 @@ Featuring…
 
 ## Why deploy.sh?
 
-deploy.sh is significantly less powerful than other open source PaaS options like [Coolify](https://coolify.io) and [Dokku](https://dokku.com). Those apps comprise tens or hundreds of thousands of lines of server-side code and dependencies that must be installed and maintained.
+deploy.sh is significantly less powerful than other open source PaaS options like [Coolify](https://coolify.io) and [Dokku](https://dokku.com). Those apps give you things like database backups, access control,. monitoring — at the cost of tens (or hundreds!) of thousands of lines of server-side code and dependencies that must be installed and maintained.
 
 On the other hand, deploy.sh is a single ~700 line Bash script that you can read, debug and customize to fit your needs. Under the hood, it's a thin wrapper over software that's (mostly) already installed on your system: [Git](https://git-scm.com), [Caddy](https://caddyserver.com)[^nginx] and [systemd-nspawn](https://www.man7.org/linux/man-pages/man1/systemd-nspawn.1.html).
 
@@ -185,7 +185,7 @@ Since it's all just files, you can inspect or modify state directly — for exam
 
 Plugins are Bash scripts dropped into `/srv/deploy/.plugins/`. They're sourced at startup, so they have access to all of deploy.sh's internal functions and variables.
 
-**Adding a command:**
+#### Adding a command:
 
 ```sh
 # /srv/deploy/.plugins/hello
@@ -203,9 +203,11 @@ deploy hello myapp
 # Hello from myapp!
 ```
 
-**Adding a post-configure hook:**
+#### Adding a hook:
 
-Post-configure hooks run after every deploy and `deploy apply`. They receive the app name and release directory as arguments.
+In addition to commands, deploy.sh lets you hook into the deploy process. Currently, deploy.sh supports one hook: post-configure.
+
+Post-configure hooks run after Caddy and systemd configuration is generated on every deploy and `deploy apply`. They receive the app name and release directory as arguments.
 
 ```sh
 # /srv/deploy/.plugins/notify
